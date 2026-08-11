@@ -1,0 +1,147 @@
+# Composer
+/vendor/
+/composer.lock
+/composer.phar
+
+# PHPUnit
+/.phpunit.cache/
+/coverage/
+/coverage.txt
+/coverage.clover
+/.phpunit.result.cache
+/phpunit.xml
+/phpunit.xml.bak
+
+# PHPStan
+/phpstan.neon
+/phpstan.neon.dist
+
+# IDE
+/.idea/
+/.vscode/
+/*.iml
+/.project
+/.buildpath
+/.settings/
+/*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+*.error_log
+*.access_log
+
+# Database
+*.sqlite
+*.sqlite-journal
+*.db
+*.db-journal
+*.sql
+*.sql.gz
+
+# Cache
+/cache/
+/temp/
+/tmp/
+*.cache
+*.ttf
+
+# Backup
+*.bak
+*.old
+*.orig
+*.swp
+*.swo
+*~
+.~*
+\#*\#
+
+# Archives
+*.zip
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# PHP
+*.php~$
+*.php.bak
+
+# Testing
+/test_output/
+/test_results/
+
+# Documentation
+/docs/_build/
+/docs/api/
+
+# User-specific
+.env
+.env.local
+.env.*.local
+.env.*.local.php
+.env.*.local.yaml
+.env.*.local.yml
+
+# Package managers
+/package-lock.json
+/yarn.lock
+/node_modules/
+
+# Build
+/build/
+/dist/
+/out/
+
+# Coverage
+/*/coverage/
+/coverages/
+
+# Deployment
+/deploy/
+/releases/
+
+# CI/CD
+/.travis.yml
+/.github/
+/.gitlab/
+/.circleci/
+
+# Private keys
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.csr
+
+# Secrets
+/secrets/
+/.secrets/
+/*.secret
+/*.secrets
+
+# Docker
+/docker-compose.override.yml
+/docker/
+/Dockerfile
+/*.dockerfile
+
+# Makefiles
+/Makefile
+/makefile
+
+# Excel/CSV (if used for imports)
+*.xlsx
+*.xls
+*.csv
+
+# Temporary test files
+/tests/fixtures/*.db
+/tests/fixtures/*.sqlite
+/tests/fixtures/*.sqlite-journal
+/tests/output/

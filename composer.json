@@ -1,0 +1,86 @@
+{
+    "name": "dovstone/mynosql",
+    "description": "MoSQL - A lightweight NoSQL database with SQL backend (MySQL/PostgreSQL/SQLite)",
+    "type": "library",
+    "keywords": [
+        "nosql",
+        "database",
+        "mysql",
+        "postgresql",
+        "sqlite",
+        "orm",
+        "doctrine",
+        "schema-less",
+        "json",
+        "mongo",
+        "mongodb",
+        "db"
+    ],
+    "homepage": "https://github.com/dovstone0911/mynosql",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Dovstone",
+            "email": "dovstone@example.com",
+            "homepage": "https://github.com/dovstone0911",
+            "role": "Developer"
+        }
+    ],
+    "require": {
+        "php": ">=8.0",
+        "doctrine/dbal": "^3.0"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^9.0",
+        "mockery/mockery": "^1.0",
+        "phpstan/phpstan": "^1.0",
+        "phpstan/phpstan-doctrine": "^1.0",
+        "phpstan/phpstan-phpunit": "^1.0",
+        "symfony/var-dumper": "^6.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Dovstone\\MoSQL\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Dovstone\\MoSQL\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit",
+        "test-coverage": "phpunit --coverage-html coverage",
+        "stan": "phpstan analyse src --level=8",
+        "check": [
+            "@stan",
+            "@test"
+        ],
+        "post-install-cmd": [
+            "@php -r \"echo '✅ MoSQL installed successfully!\\n';\""
+        ]
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true,
+    "config": {
+        "sort-packages": true,
+        "optimize-autoloader": true,
+        "preferred-install": "dist"
+    },
+    "extra": {
+        "branch-alias": {
+            "dev-main": "1.0.x-dev"
+        }
+    },
+    "funding": [
+        {
+            "type": "github",
+            "url": "https://github.com/sponsors/dovstone0911"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/dovstone0911/mynosql/issues",
+        "source": "https://github.com/dovstone0911/mynosql",
+        "docs": "https://github.com/dovstone0911/mynosql/blob/main/README.md"
+    }
+}
