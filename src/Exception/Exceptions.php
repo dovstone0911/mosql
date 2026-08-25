@@ -5,39 +5,39 @@ namespace Dovstone\MoSQL\Exception;
 /**
  * Exception de base pour MoSQL
  */
-class MyNoSQLException extends \Exception {}
+class MoSQLException extends \Exception {}
 
 /**
  * Lancée lorsqu'un document n'est pas trouvé
  */
-class DocumentNotFoundException extends MyNoSQLException {}
+class DocumentNotFoundException extends MoSQLException {}
 
 /**
  * Lancée lorsqu'un doublon est détecté (UID déjà existant)
  */
-class DuplicateException extends MyNoSQLException {}
+class DuplicateException extends MoSQLException {}
 
 /**
  * Lancée lorsqu'un argument passé est invalide
  */
-class InvalidArgumentException extends MyNoSQLException {}
+class InvalidArgumentException extends MoSQLException {}
 
 /**
  * Lancée lorsqu'une erreur de cache survient
  */
-class CacheException extends MyNoSQLException {}
+class CacheException extends MoSQLException {}
 
 /**
  * Lancée lorsqu'une opération de base de données échoue
  */
-class DatabaseException extends MyNoSQLException {}
+class DatabaseException extends MoSQLException {}
 
 /**
  * Lancée lorsqu'une erreur de schéma survient
  */
-class SchemaException extends MyNoSQLException {}
+class SchemaException extends MoSQLException {}
 
 /**
  * Lancée lorsqu'une erreur de configuration survient
  */
-class ConfigurationException extends MyNoSQLException {}
+class ConfigurationException extends MoSQLException {}

@@ -75,7 +75,7 @@ class CacheManager
     private CacheInterface $cache;
     private bool $enabled;
     private int $defaultTTL;
-    private string $prefix = 'mynosql_';
+    private string $prefix = 'MoSQL_';
     private int $version = 1;
 
     public function __construct(?CacheInterface $cache = null, bool $enabled = false, int $defaultTTL = 3600)

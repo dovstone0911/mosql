@@ -5,65 +5,9 @@ namespace Dovstone\MoSQL\Schema;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\Schema\Schema;
 use Doctrine\DBAL\Types\Type;
+use Doctrine\DBAL\Types\Types;
 use Dovstone\MoSQL\Exception\SchemaException;
-
-/**
- * Détection automatique des types SQL
- */
-class TypeGuesser
-{
-    public static function guess($value): string
-    {
-        if ($value === null) {
-            return 'string';
-        }
-
-        $type = gettype($value);
-
-        return match ($type) {
-            'integer' => 'integer',
-            'double' => 'float',
-            'boolean' => 'boolean',
-            'array', 'object' => 'json',
-            'string' => self::guessStringType($value),
-            default => 'string',
-        };
-    }
-
-    private static function guessStringType(string $value): string
-    {
-        // Vérifier si c'est une date
-        if (strtotime($value) !== false) {
-            return 'datetime';
-        }
-
-        // Vérifier la longueur
-        if (strlen($value) > 255) {
-            return 'text';
-        }
-
-        return 'string';
-    }
-
-    public static function guessLength($value): ?int
-    {
-        if (!is_string($value)) {
-            return null;
-        }
-
-        $len = strlen($value);
-        if ($len > 255) {
-            return null; // TEXT
-        }
-        if ($len > 100) {
-            return 255;
-        }
-        if ($len > 50) {
-            return 100;
-        }
-        return 50;
-    }
-}
+use Dovstone\MoSQL\Schema\TypeGuesser;
 
 /**
  * Gestionnaire de schéma avec création automatique
@@ -81,7 +25,7 @@ class SchemaManager
         $this->connection = $connection;
         $this->prefix = $options['table_prefix'] ?? '';
         $this->autoCreate = $options['auto_create_schema'] ?? true;
-        $this->tableName = $this->prefix . $collection;
+        $this->tableName = preg_replace('/[^a-zA-Z0-9_]/', '_', $this->prefix . $collection);
     }
 
     public function ensureTableExists(): void
@@ -103,16 +47,24 @@ class SchemaManager
         $schema = $sm->createSchema();
         $table = $schema->createTable($this->tableName);
 
-        // Clé primaire auto-incrémentée
         $table->addColumn('id', 'integer', ['autoincrement' => true]);
         $table->setPrimaryKey(['id']);
 
-        // UID unique (clé publique)
         $table->addColumn('uid', 'string', ['length' => 10, 'notnull' => true]);
         $table->addUniqueIndex(['uid']);
-        $table->addIndex(['uid'], 'idx_' . $this->tableName . '_uid');
 
-        // Timestamps
+        // 🔥 Ajouter coll_name si la table n'est pas '*'
+        if ($this->tableName !== '*') {
+            $table->addColumn('coll_name', 'string', ['length' => 100, 'notnull' => false]);
+        }
+
+        $cleanTableName = preg_replace('/[^a-zA-Z0-9_]/', '_', $this->tableName);
+        $indexName = 'idx_' . $cleanTableName . '_uid';
+        if (strlen($indexName) > 64) {
+            $indexName = 'idx_' . substr(md5($this->tableName), 0, 20) . '_uid';
+        }
+        $table->addIndex(['uid'], $indexName);
+
         $table->addColumn('created_at', 'datetime', ['default' => 'CURRENT_TIMESTAMP']);
         $table->addColumn('updated_at', 'datetime', ['default' => 'CURRENT_TIMESTAMP']);
 
@@ -127,18 +79,21 @@ class SchemaManager
 
         try {
             $sm = $this->connection->createSchemaManager();
-            $schema = $sm->createSchema();
-            $table = $schema->getTable($this->tableName);
+            // On liste les colonnes existantes via listTableColumns (plus rapide que createSchema)
+            $existingColumns = [];
+            if ($sm->tablesExist([$this->tableName])) {
+                foreach ($sm->listTableColumns($this->tableName) as $col) {
+                    $existingColumns[$col->getName()] = true;
+                }
+            }
 
             $columnsToAdd = [];
-
             foreach ($document as $field => $value) {
                 if (in_array($field, ['id', 'uid', 'created_at', 'updated_at'])) {
                     continue;
                 }
-
-                if (!$table->hasColumn($field)) {
-                    $type = TypeGuesser::guess($value);
+                if (!isset($existingColumns[$field])) {
+                    $type = TypeGuesser::guess($value); // retourne string: 'json', 'string'...
                     $length = TypeGuesser::guessLength($value);
                     $columnsToAdd[$field] = ['type' => $type, 'length' => $length];
                 }
@@ -154,38 +109,69 @@ class SchemaManager
 
     private function addColumns(array $columns): void
     {
-        $sm = $this->connection->createSchemaManager();
-        $schema = $sm->createSchema();
-        $table = $schema->getTable($this->tableName);
+        try {
+            $map = [
+                'string'   => Types::STRING,
+                'integer'  => Types::INTEGER,
+                'float'    => Types::FLOAT,
+                'boolean'  => Types::BOOLEAN,
+                'json'     => Types::JSON,
+                'text'     => Types::TEXT,
+                'datetime' => Types::DATETIME_MUTABLE,
+            ];
 
-        foreach ($columns as $name => $config) {
-            $type = Type::getType($config['type']);
-            $options = ['notnull' => false];
+            foreach ($columns as $name => $config) {
+                $typeName = $config['type'] ?? 'string';
 
-            if ($config['length'] ?? null) {
-                $options['length'] = $config['length'];
+                if ($typeName instanceof Type) {
+                    $typeName = $typeName->getName();
+                }
+                $typeName = strtolower((string) $typeName);
+                $dbalTypeName = $map[$typeName] ?? Types::STRING;
+
+                $type = Type::getType($dbalTypeName);
+                $platform = $this->connection->getDatabasePlatform();
+
+                $options = ['notnull' => false];
+                if (!empty($config['length'])) {
+                    $options['length'] = (int) $config['length'];
+                }
+
+                $sqlDeclaration = $type->getSQLDeclaration($options, $platform);
+
+                $this->connection->executeStatement(sprintf(
+                    'ALTER TABLE %s ADD COLUMN %s %s',
+                    $this->connection->quoteIdentifier($this->tableName),
+                    $this->connection->quoteIdentifier($name),
+                    $sqlDeclaration
+                ));
             }
 
-            $table->addColumn($name, $type, $options);
+            $this->loadSchema();
+        } catch (\Exception $e) {
+            throw new SchemaException("Failed to add columns: " . $e->getMessage(), 0, $e);
         }
-
-        $sm->alterTable($table);
-        $this->loadSchema();
     }
 
     private function loadSchema(): void
     {
-        $sm = $this->connection->createSchemaManager();
-        $schema = $sm->createSchema();
-        $table = $schema->getTable($this->tableName);
+        try {
+            $sm = $this->connection->createSchemaManager();
+            if (!$sm->tablesExist([$this->tableName])) {
+                $this->schema = [];
+                return;
+            }
 
-        $this->schema = [];
-        foreach ($table->getColumns() as $column) {
-            $this->schema[$column->getName()] = [
-                'type' => $column->getType()->getName(),
-                'length' => $column->getLength(),
-                'notnull' => $column->getNotnull(),
-            ];
+            $this->schema = [];
+            foreach ($sm->listTableColumns($this->tableName) as $column) {
+                $this->schema[$column->getName()] = [
+                    'type' => $column->getType()->getName(),
+                    'length' => $column->getLength(),
+                    'notnull' => $column->getNotnull(),
+                ];
+            }
+        } catch (\Exception $e) {
+            throw new SchemaException("Failed to load schema: " . $e->getMessage(), 0, $e);
         }
     }
 
@@ -225,7 +211,12 @@ class SchemaManager
     public function truncate(): void
     {
         try {
-            $this->connection->executeStatement("TRUNCATE TABLE {$this->tableName}");
+            $platform = $this->connection->getDatabasePlatform()->getName();
+            if ($platform === 'sqlite') {
+                $this->connection->executeStatement("DELETE FROM {$this->tableName}");
+            } else {
+                $this->connection->executeStatement("TRUNCATE TABLE {$this->tableName}");
+            }
         } catch (\Exception $e) {
             throw new SchemaException("Failed to truncate table: " . $e->getMessage(), 0, $e);
         }
