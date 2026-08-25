@@ -1,5 +1,5 @@
 {
-    "name": "dovstone/MoSQL",
+    "name": "dovstone/mosql",
     "description": "MoSQL - A lightweight NoSQL database with SQL backend (MySQL/PostgreSQL/SQLite)",
     "type": "library",
     "keywords": [
@@ -16,7 +16,7 @@
         "mongodb",
         "db"
     ],
-    "homepage": "https://github.com/dovstone0911/MoSQL",
+    "homepage": "https://github.com/dovstone0911/mosql",
     "license": "MIT",
     "authors": [
         {
@@ -79,8 +79,8 @@
         }
     ],
     "support": {
-        "issues": "https://github.com/dovstone0911/MoSQL/issues",
-        "source": "https://github.com/dovstone0911/MoSQL",
-        "docs": "https://github.com/dovstone0911/MoSQL/blob/main/README.md"
+        "issues": "https://github.com/dovstone0911/mosql/issues",
+        "source": "https://github.com/dovstone0911/mosql",
+        "docs": "https://github.com/dovstone0911/mosql/blob/main/README.md"
     }
 }
