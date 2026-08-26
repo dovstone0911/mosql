@@ -3,7 +3,7 @@
 ```markdown
 # MoSQL - ORM Légère avec Support JSON, UID et Cache
 
-[![PHP Version](https://img.shields.io/badge/PHP-7.4%2B-777BB4.svg?style=flat&logo=php)](https://php.net)
+[![PHP Version](https://img.shields.io/badge/PHP-8.0%2B-777BB4.svg?style=flat&logo=php)](https://php.net)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Doctrine DBAL](https://img.shields.io/badge/Doctrine-DBAL-FF6B00.svg?style=flat&logo=doctrine)](https://www.doctrine-project.org/projects/dbal.html)
 
