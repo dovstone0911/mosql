@@ -1,0 +1,865 @@
+<?php
+
+namespace Dovstone\MoSQL;
+
+use Doctrine\DBAL\Connection;
+use Doctrine\DBAL\DriverManager;
+use Dovstone\MoSQL\Cache\CacheManager;
+use Dovstone\MoSQL\Cache\ArrayCache;
+use Dovstone\MoSQL\Query\QueryBuilder;
+use Dovstone\MoSQL\Schema\SchemaManager;
+use Dovstone\MoSQL\Document\DocumentManager;
+use Dovstone\MoSQL\Uid\UidGenerator;
+use Dovstone\MoSQL\Exception\DocumentNotFoundException;
+use Dovstone\MoSQL\Exception\DuplicateException;
+use Dovstone\MoSQL\Exception\InvalidArgumentException;
+use Dovstone\MoSQL\Exception\DatabaseException;
+
+class MoSQL
+{
+    private Connection $connection;
+    private string $collection;
+    private QueryBuilder $queryBuilder;
+    private SchemaManager $schemaManager;
+    private DocumentManager $documentManager;
+    private CacheManager $cacheManager;
+    private UidGenerator $uidGenerator;
+    private array $options;
+    private array $uidCache = [];
+
+    public function __construct(?string $collection, array $dbParams = [], array $options = [])
+    {
+        // Si pas de collection, on crée juste une connexion
+        if ($collection === null) {
+            $this->connection = DriverManager::getConnection($dbParams);
+            $this->collection = '';
+            $this->options = $options;
+            $this->cacheManager = new CacheManager(
+                new ArrayCache(),
+                $options['cache_enabled'] ?? false,
+                $options['cache_ttl'] ?? 3600
+            );
+            return;
+        }
+
+        $this->collection = $collection;
+        $this->options = array_merge([
+            'uid_length' => 8,
+            'table_prefix' => '',
+            'auto_create_schema' => true,
+            'cache_enabled' => false,
+            'cache_ttl' => 3600,
+        ], $options);
+
+        $this->connection = DriverManager::getConnection($dbParams);
+        $this->schemaManager = new SchemaManager($this->connection, $collection, $this->options);
+        $this->documentManager = new DocumentManager($this->connection, $this->schemaManager);
+        $this->queryBuilder = new QueryBuilder($this->connection, $this->schemaManager);
+        $this->uidGenerator = new UidGenerator($this->options['uid_length']);
+        $this->cacheManager = new CacheManager(
+            new ArrayCache(),
+            $this->options['cache_enabled'],
+            $this->options['cache_ttl']
+        );
+
+        $this->schemaManager->ensureTableExists();
+    }
+
+    // ================================================================
+    // 1. REQUÊTES
+    // ================================================================
+
+    public function where(string $field, string $operator, mixed $value): self
+    {
+        $this->queryBuilder->where($field, $operator, $value);
+        return $this;
+    }
+
+    public function orWhere(string $field, string $operator, mixed $value): self
+    {
+        $this->queryBuilder->orWhere($field, $operator, $value);
+        return $this;
+    }
+
+    public function andWhere(callable $callback): self
+    {
+        $this->queryBuilder->andWhere($callback);
+        return $this;
+    }
+
+    public function whereIn(string $field, array $values): self
+    {
+        $this->queryBuilder->whereIn($field, $values);
+        return $this;
+    }
+
+    public function whereLike(string $field, string $pattern): self
+    {
+        $this->queryBuilder->whereLike($field, $pattern);
+        return $this;
+    }
+
+    public function whereBetween(string $field, $min, $max): self
+    {
+        $this->queryBuilder->whereBetween($field, $min, $max);
+        return $this;
+    }
+
+    public function whereNull(string $field): self
+    {
+        $this->queryBuilder->whereNull($field);
+        return $this;
+    }
+
+    public function whereNotNull(string $field): self
+    {
+        $this->queryBuilder->whereNotNull($field);
+        return $this;
+    }
+
+    public function whereJsonContains(string $field, string $value): self
+    {
+        $this->queryBuilder->whereJsonContains($field, $value);
+        return $this;
+    }
+
+    public function whereJsonNotContains(string $field, string $value): self
+    {
+        $this->queryBuilder->whereJsonNotContains($field, $value);
+        return $this;
+    }
+
+    public function select(array $fields): self
+    {
+        $this->queryBuilder->select($fields);
+        return $this;
+    }
+
+    public function orderBy(string $field, string $direction = 'ASC'): self
+    {
+        $this->queryBuilder->orderBy($field, $direction);
+        return $this;
+    }
+
+    public function limit(int $limit, ?int $offset = null): self
+    {
+        $this->queryBuilder->limit($limit, $offset);
+        return $this;
+    }
+
+    public function offset(int $offset): self
+    {
+        $this->queryBuilder->offset($offset);
+        return $this;
+    }
+
+    public function join(string $collection, string $localField, string $operator, string $foreignField, string $type = 'inner'): self
+    {
+        $this->queryBuilder->join($collection, $localField, $operator, $foreignField, $type);
+        return $this;
+    }
+
+    public function leftJoin(string $collection, string $localField, string $operator, string $foreignField): self
+    {
+        return $this->join($collection, $localField, $operator, $foreignField, 'left');
+    }
+
+    public function innerJoin(string $collection, string $localField, string $operator, string $foreignField): self
+    {
+        return $this->join($collection, $localField, $operator, $foreignField, 'inner');
+    }
+
+    // ================================================================
+    // 2. EXÉCUTION
+    // ================================================================
+
+    public function fetchAll(): array
+    {
+        $cacheKey = $this->buildCacheKey();
+        $cached = $this->cacheManager->get($cacheKey);
+        if ($cached !== null) {
+            return $cached;
+        }
+
+        $qb = $this->queryBuilder->build();
+        $results = $qb->fetchAllAssociative();
+        $results = $this->documentManager->hydrateAll($results);
+
+        $this->cacheManager->set($cacheKey, $results);
+        return $results;
+    }
+
+    public function fetchOne(): ?array
+    {
+        $this->limit(1);
+        $results = $this->fetchAll();
+        return $results[0] ?? null;
+    }
+
+    public function find(int $id): ?array
+    {
+        return $this->findById($id);
+    }
+
+    public function findOne(): ?array
+    {
+        return $this->fetchOne();
+    }
+
+    public function count(): int
+    {
+        $qb = $this->queryBuilder->build();
+        $qb->select('COUNT(*) as count');
+        $result = $qb->fetchAssociative();
+        return (int)($result['count'] ?? 0);
+    }
+
+    // ================================================================
+    // 3. FIND
+    // ================================================================
+
+    // public function find(string $uid): ?array
+    // {
+    //     $cached = $this->cacheManager->get("document_uid_{$uid}");
+    //     if ($cached !== null) {
+    //         return $cached;
+    //     }
+
+    //     $this->reset();
+    //     $result = $this->where('uid', '=', $uid)->fetchOne();
+    //     if ($result) {
+    //         $this->cacheManager->set("document_uid_{$uid}", $result);
+    //     }
+    //     return $result;
+    // }
+
+    public function findOrFail(string $uid): array
+    {
+        $result = $this->find($uid);
+        if ($result === null) {
+            throw new DocumentNotFoundException("Document with UID '{$uid}' not found");
+        }
+        return $result;
+    }
+
+    public function findById(int $id): ?array
+    {
+        $cached = $this->cacheManager->get("document_id_{$id}");
+        if ($cached !== null) {
+            return $cached;
+        }
+
+        $this->reset();
+        $result = $this->where('id', '=', $id)->fetchOne();
+        if ($result) {
+            $this->cacheManager->set("document_id_{$id}", $result);
+        }
+        return $result;
+    }
+
+    public function findByIdentifier(string|int $identifier): ?array
+    {
+        if (is_numeric($identifier)) {
+            return $this->findById((int)$identifier);
+        }
+        return $this->find((string)$identifier);
+    }
+
+    public function findAll(): array
+    {
+        $this->reset();
+        return $this->fetchAll();
+    }
+
+    public function first(): ?array
+    {
+        $this->reset();
+        $this->limit(1);
+        $results = $this->fetchAll();
+        return $results[0] ?? null;
+    }
+
+    public function last(): ?array
+    {
+        $this->reset();
+        $this->orderBy('id', 'DESC')->limit(1);
+        $results = $this->fetchAll();
+        return $results[0] ?? null;
+    }
+
+    public function findBy(array $criteria, ?array $orderBy = null, ?int $limit = null, ?int $offset = null): array
+    {
+        $this->reset();
+
+        foreach ($criteria as $field => $value) {
+            if (is_array($value)) {
+                $this->whereIn($field, $value);
+            } else {
+                $this->where($field, '=', $value);
+            }
+        }
+
+        if ($orderBy) {
+            foreach ($orderBy as $field => $direction) {
+                $this->orderBy($field, $direction);
+            }
+        }
+
+        if ($limit !== null) {
+            $this->limit($limit, $offset);
+        }
+
+        return $this->fetchAll();
+    }
+
+    // ================================================================
+    // 12. FIND UIDS
+    // ================================================================
+
+    /**
+     * Récupère les UIDs des documents correspondant aux critères
+     * 
+     * @param array $criteria Critères de recherche (comme findBy)
+     * @param array $orderBy Tri
+     * @param int|null $limit Limite
+     * @param int|null $offset Offset
+     * @return array Liste des UIDs
+     * 
+     * @example
+     * // Récupérer les UIDs des utilisateurs actifs
+     * $uids = $users->findIDs(['status' => 'active']);
+     * 
+     * // Avec tri
+     * $uids = $users->findIDs(['status' => 'active'], ['age' => 'DESC']);
+     * 
+     * // Avec limite
+     * $uids = $users->findIDs(['status' => 'active'], null, 10);
+     * 
+     * // Critères avec opérateurs
+     * $uids = $users->findIDs(['age' => ['>', 18]]);
+     */
+    public function findIDs(array $criteria = [], ?array $orderBy = null, ?int $limit = null, ?int $offset = null): array
+    {
+        $this->reset();
+
+        foreach ($criteria as $field => $value) {
+            if (is_array($value) && isset($value[0]) && isset($value[1])) {
+                $this->where($field, $value[0], $value[1]);
+            } else {
+                $this->where($field, '=', $value);
+            }
+        }
+
+        if ($orderBy) {
+            foreach ($orderBy as $field => $direction) {
+                $this->orderBy($field, $direction);
+            }
+        }
+
+        if ($limit !== null) {
+            $this->limit($limit, $offset);
+        }
+
+        $results = $this->select(['uid'])->fetchAll();
+        return array_column($results, 'uid');
+    }
+
+    /**
+     * Récupère les UIDs depuis la requête en cours
+     */
+    public function findIDsFromQuery(): array
+    {
+        $results = $this->select(['uid'])->fetchAll();
+        return array_column($results, 'uid');
+    }
+
+    public function findOneBy(array $criteria): ?array
+    {
+        $this->reset();
+
+        foreach ($criteria as $field => $value) {
+            $this->where($field, '=', $value);
+        }
+
+        return $this->fetchOne();
+    }
+
+    // ================================================================
+    // 4. CRUD - INSERT
+    // ================================================================
+
+    public function insert(array $document): string
+    {
+        if (!isset($document['uid'])) {
+            $document['uid'] = $this->uidGenerator->generate();
+        }
+
+        $existing = $this->findIdByUid($document['uid']);
+        if ($existing !== null) {
+            throw new DuplicateException("UID '{$document['uid']}' already exists");
+        }
+
+        try {
+            $id = $this->documentManager->insert($document);
+            $this->uidCache[$document['uid']] = $id;
+            $this->cacheManager->clear();
+            return $document['uid'];
+        } catch (\Exception $e) {
+            throw new DatabaseException($e->getMessage(), 0, $e);
+        }
+    }
+
+    public function insertMany(array $documents): array
+    {
+        $this->connection->beginTransaction();
+        $uids = [];
+
+        try {
+            foreach ($documents as $doc) {
+                $uids[] = $this->insert($doc);
+            }
+            $this->connection->commit();
+            return $uids;
+        } catch (\Exception $e) {
+            $this->connection->rollBack();
+            throw $e;
+        }
+    }
+
+    // ================================================================
+    // 5. CRUD - UPDATE
+    // ================================================================
+
+    public function update(array $data): int
+    {
+        $conditions = [];
+        $hasJsonCondition = false;
+
+        foreach ($this->queryBuilder->getConditions() as $cond) {
+            if ($cond['operator'] === 'JSON_CONTAINS' || $cond['operator'] === 'JSON_EXTRACT') {
+                $hasJsonCondition = true;
+            } else {
+                $conditions[$cond['field']] = $cond['value'];
+            }
+        }
+
+        if ($hasJsonCondition) {
+            $results = $this->select(['id'])->fetchAll();
+            $ids = array_column($results, 'id');
+
+            if (empty($ids)) {
+                return 0;
+            }
+
+            $this->reset();
+            $this->whereIn('id', $ids);
+            $conditions = [];
+            foreach ($this->queryBuilder->getConditions() as $cond) {
+                if ($cond['operator'] !== 'JSON_CONTAINS' && $cond['operator'] !== 'JSON_EXTRACT') {
+                    $conditions[$cond['field']] = $cond['value'];
+                }
+            }
+        }
+
+        if (empty($conditions)) {
+            throw new InvalidArgumentException("No conditions provided for update operation");
+        }
+
+        try {
+            $result = $this->documentManager->update($data, $conditions);
+            $this->cacheManager->clear();
+            return $result;
+        } catch (\Exception $e) {
+            throw new DatabaseException($e->getMessage(), 0, $e);
+        }
+    }
+
+    public function updateByUid(string $uid, array $data): int
+    {
+        $this->reset();
+        $this->where('uid', '=', $uid);
+        return $this->update($data);
+    }
+
+    public function updateById(int $id, array $data): int
+    {
+        $this->reset();
+        $this->where('id', '=', $id);
+        return $this->update($data);
+    }
+
+    public function upsert(array $data): string
+    {
+        if (isset($data['uid'])) {
+            $existing = $this->find($data['uid']);
+            if ($existing) {
+                $this->updateByUid($data['uid'], $data);
+                return $data['uid'];
+            }
+        }
+        return $this->insert($data);
+    }
+
+    // ================================================================
+    // 6. CRUD - DELETE
+    // ================================================================
+
+    public function delete(): int
+    {
+        $conditions = [];
+        $hasJsonCondition = false;
+
+        foreach ($this->queryBuilder->getConditions() as $cond) {
+            if ($cond['operator'] === 'JSON_CONTAINS' || $cond['operator'] === 'JSON_EXTRACT') {
+                $hasJsonCondition = true;
+            } else {
+                $conditions[$cond['field']] = $cond['value'];
+            }
+        }
+
+        if ($hasJsonCondition) {
+            $results = $this->select(['id'])->fetchAll();
+            $ids = array_column($results, 'id');
+
+            if (empty($ids)) {
+                return 0;
+            }
+
+            $this->reset();
+            $this->whereIn('id', $ids);
+            $conditions = [];
+            foreach ($this->queryBuilder->getConditions() as $cond) {
+                if ($cond['operator'] !== 'JSON_CONTAINS' && $cond['operator'] !== 'JSON_EXTRACT') {
+                    $conditions[$cond['field']] = $cond['value'];
+                }
+            }
+        }
+
+        if (empty($conditions)) {
+            throw new InvalidArgumentException("No conditions provided for delete operation");
+        }
+
+        try {
+            $result = $this->documentManager->delete($conditions);
+            $this->cacheManager->clear();
+            return $result;
+        } catch (\Exception $e) {
+            throw new DatabaseException($e->getMessage(), 0, $e);
+        }
+    }
+
+    public function deleteByUid(string $uid): int
+    {
+        $this->reset();
+        $this->where('uid', '=', $uid);
+        return $this->delete();
+    }
+
+    public function deleteById(int $id): int
+    {
+        $this->reset();
+        $this->where('id', '=', $id);
+        return $this->delete();
+    }
+
+    public function deleteAll(): int
+    {
+        $this->reset();
+        return $this->documentManager->delete([]);
+    }
+
+    public function truncate(): void
+    {
+        $this->documentManager->truncate();
+        $this->cacheManager->clear();
+    }
+
+    // ================================================================
+    // 7. CACHE
+    // ================================================================
+
+    public function cache(bool $enabled = true, ?int $ttl = null): self
+    {
+        if ($enabled) {
+            $this->cacheManager->enable();
+        } else {
+            $this->cacheManager->disable();
+        }
+        if ($ttl !== null) {
+            $this->cacheManager->setDefaultTTL($ttl);
+        }
+        return $this;
+    }
+
+    public function invalidate(string|int $identifier): self
+    {
+        $this->cacheManager->invalidateDocument($identifier);
+        return $this;
+    }
+
+    public function invalidateAll(): self
+    {
+        $this->cacheManager->clear();
+        return $this;
+    }
+
+    // ================================================================
+    // 8. CONVERSION UID ↔ ID
+    // ================================================================
+
+    public function findIdByUid(string $uid): ?int
+    {
+        if (isset($this->uidCache[$uid])) {
+            return $this->uidCache[$uid];
+        }
+
+        $this->reset();
+        $result = $this->where('uid', '=', $uid)->select(['id'])->fetchOne();
+        if ($result) {
+            $this->uidCache[$uid] = (int)$result['id'];
+            return (int)$result['id'];
+        }
+        return null;
+    }
+
+    public function findUidById(int $id): ?string
+    {
+        $this->reset();
+        $result = $this->where('id', '=', $id)->select(['uid'])->fetchOne();
+        return $result['uid'] ?? null;
+    }
+
+    // ================================================================
+    // 9. UTILITAIRES
+    // ================================================================
+
+    public function reset(): self
+    {
+        $this->queryBuilder->reset();
+        return $this;
+    }
+
+    public function getConnection(): Connection
+    {
+        return $this->connection;
+    }
+
+    public function getSchema(): array
+    {
+        return $this->schemaManager->getSchema();
+    }
+
+    public function getTableName(): string
+    {
+        return $this->schemaManager->getTableName();
+    }
+
+    public function paginate(int $perPage = 10, int $page = 1): array
+    {
+        $offset = ($page - 1) * $perPage;
+        $this->limit($perPage, $offset);
+
+        $items = $this->fetchAll();
+        $total = $this->count();
+
+        return [
+            'items' => $items,
+            'total' => $total,
+            'per_page' => $perPage,
+            'current_page' => $page,
+            'last_page' => ceil($total / $perPage),
+            'from' => $offset + 1,
+            'to' => $offset + count($items),
+        ];
+    }
+
+    public function distinct(string $field): array
+    {
+        $qb = $this->connection->createQueryBuilder();
+        $qb->select("DISTINCT `$field`")
+            ->from($this->getTableName());
+        $results = $qb->fetchAllAssociative();
+        return array_column($results, $field);
+    }
+
+    public function pluck(string $value, ?string $key = null): array
+    {
+        $results = $this->fetchAll();
+        if ($key === null) {
+            return array_column($results, $value);
+        }
+
+        $plucked = [];
+        foreach ($results as $row) {
+            $plucked[$row[$key] ?? ''] = $row[$value] ?? null;
+        }
+        return $plucked;
+    }
+
+    public function pairs(string $keyField, string $valueField): array
+    {
+        return $this->pluck($valueField, $keyField);
+    }
+
+    public function drop(): void
+    {
+        $this->schemaManager->dropTable();
+        $this->cacheManager->clear();
+    }
+
+    public function toArray(): array
+    {
+        return $this->fetchAll();
+    }
+
+    public function toJson(int $flags = JSON_PRETTY_PRINT): string
+    {
+        return json_encode($this->fetchAll(), $flags);
+    }
+
+    public function dd(): void
+    {
+        dd($this->fetchAll());
+    }
+
+    public function rawQuery(string $sql, array $params = []): array|int
+    {
+        if (str_starts_with(strtoupper(trim($sql)), 'SELECT')) {
+            return $this->connection->executeQuery($sql, $params)->fetchAllAssociative();
+        }
+        return $this->connection->executeStatement($sql, $params);
+    }
+
+    // ================================================================
+    // 10. MÉTHODES MAGIQUES
+    // ================================================================
+
+    public function __call(string $method, array $arguments)
+    {
+        if (str_starts_with($method, 'findBy') && strlen($method) > 6) {
+            $field = substr($method, 6);
+            $operator = '=';
+            $operators = ['GreaterThan', 'LessThan', 'GreaterThanOrEqual', 'LessThanOrEqual', 'Like', 'In'];
+
+            foreach ($operators as $op) {
+                if (str_ends_with($field, $op)) {
+                    $field = substr($field, 0, -strlen($op));
+                    $operator = match ($op) {
+                        'GreaterThan' => '>',
+                        'LessThan' => '<',
+                        'GreaterThanOrEqual' => '>=',
+                        'LessThanOrEqual' => '<=',
+                        'Like' => 'LIKE',
+                        'In' => 'IN',
+                        default => '=',
+                    };
+                    break;
+                }
+            }
+
+            $this->reset();
+            $this->where($field, $operator, $arguments[0]);
+
+            if (isset($arguments[1]) && is_array($arguments[1])) {
+                foreach ($arguments[1] as $f => $d) {
+                    $this->orderBy($f, $d);
+                }
+            }
+
+            if (isset($arguments[2])) {
+                $this->limit($arguments[2]);
+            }
+
+            return $this->fetchAll();
+        }
+
+        if (str_starts_with($method, 'findOneBy') && strlen($method) > 9) {
+            $field = substr($method, 9);
+            $operator = '=';
+            $operators = ['GreaterThan', 'LessThan', 'GreaterThanOrEqual', 'LessThanOrEqual', 'Like'];
+
+            foreach ($operators as $op) {
+                if (str_ends_with($field, $op)) {
+                    $field = substr($field, 0, -strlen($op));
+                    $operator = match ($op) {
+                        'GreaterThan' => '>',
+                        'LessThan' => '<',
+                        'GreaterThanOrEqual' => '>=',
+                        'LessThanOrEqual' => '<=',
+                        'Like' => 'LIKE',
+                        default => '=',
+                    };
+                    break;
+                }
+            }
+
+            $this->reset();
+            $this->where($field, $operator, $arguments[0]);
+            return $this->fetchOne();
+        }
+
+        throw new \BadMethodCallException("Method '{$method}' does not exist");
+    }
+
+    // ================================================================
+    // 11. PRIVÉES
+    // ================================================================
+
+    private function buildCacheKey(): string
+    {
+        $qb = $this->queryBuilder;
+        return md5(
+            $this->collection .
+                json_encode($qb->getConditions()) .
+                json_encode($qb->getProjection()) .
+                json_encode($qb->getOrderBy()) .
+                ($qb->getLimit() ?? 'null') .
+                ($qb->getOffset() ?? 'null') .
+                json_encode($qb->getJoins()) .
+                json_encode($qb->getGroups())
+        );
+    }
+    
+    // ================================================================
+    // 13. COUNT BY
+    // ================================================================
+
+    /**
+     * Compte les documents correspondant aux critères
+     * 
+     * @param array $criteria Critères de recherche
+     * @return int Nombre de documents
+     * 
+     * @example
+     * // Compte les utilisateurs actifs
+     * $count = $users->countBy(['status' => 'active']);
+     * 
+     * // Avec opérateur
+     * $count = $users->countBy(['age' => ['>', 18]]);
+     * 
+     * // Avec plusieurs critères
+     * $count = $users->countBy([
+     *     ['status', '=', 'active'],
+     *     ['age', '>', 18]
+     * ]);
+     */
+    public function countBy(array $criteria): int
+    {
+        $this->reset();
+
+        foreach ($criteria as $field => $value) {
+            if (is_array($value) && isset($value[0]) && isset($value[1])) {
+                // ['age' => ['>', 18]]
+                $this->where($field, $value[0], $value[1]);
+            } elseif (is_array($value) && isset($value[0]) && isset($value[1]) && isset($value[2])) {
+                // ['age', '>', 18]
+                $this->where($value[0], $value[1], $value[2]);
+            } else {
+                // ['status' => 'active']
+                $this->where($field, '=', $value);
+            }
+        }
+
+        return $this->count();
+    }
+}
