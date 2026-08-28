@@ -19,6 +19,7 @@ use Dovstone\MoSQL\Uid\UidGenerator;
 
 /**
  * MoSQL - Bibliothèque ORM légère avec support JSON, ID, Cache et Requêtes avancées
+ * MoSQL - Bibliothèque ORM légère avec support JSON, ID, Cache et Requêtes avancées
  * 
  * @package Dovstone\MoSQL
  * @author Dovstone
@@ -65,6 +66,7 @@ class MoSQL
     // 🔥 Connexion partagée (Singleton)
     private static ?Connection $sharedConnection = null;
     private static array $sharedConfig = [];
+    private const FALSY_VALUE = '😅';
     private const FALSY_VALUE = '😅';
 
     // ================================================================
@@ -761,6 +763,11 @@ class MoSQL
             return $this;
         }
 
+        return $this->proxyDirect('select', [array_merge($fields, ['uid', 'id', 'coll_name'])]);
+        if (empty($fields)) {
+            return $this;
+        }
+
         return $this->proxyDirect('select', [$fields]);
     }
 
@@ -845,6 +852,7 @@ class MoSQL
      * @return self
      * 
      * @example
+     * $users->orderByField('id', ['A7kR9qW2', 'B8sT4vX3']);
      * $users->orderByField('id', ['A7kR9qW2', 'B8sT4vX3']);
      */
     public function orderByField(string $field, array $orderValues): self
@@ -1032,15 +1040,19 @@ class MoSQL
 
                 if (in_array($operator, ['in', 'not in'])) {
                     $this->whereIn($field, $value[2] ?: [self::FALSY_VALUE]);
+                    $this->whereIn($field, $value[2] ?: [self::FALSY_VALUE]);
                 } elseif ($operator === 'between') {
                     $this->whereBetween($field, $value[2][0] ?: self::FALSY_VALUE, $value[2][1] ?: self::FALSY_VALUE);
+                    $this->whereBetween($field, $value[2][0] ?: self::FALSY_VALUE, $value[2][1] ?: self::FALSY_VALUE);
                 } elseif ($operator === 'like') {
+                    $this->whereLike($field, $value[2] ?: self::FALSY_VALUE);
                     $this->whereLike($field, $value[2] ?: self::FALSY_VALUE);
                 } elseif ($operator === 'null' || $operator === 'is null') {
                     $this->whereNull($field);
                 } elseif ($operator === 'not null' || $operator === 'is not null') {
                     $this->whereNotNull($field);
                 } else {
+                    $this->where($field, $value[1], $value[2] ?: self::FALSY_VALUE);
                     $this->where($field, $value[1], $value[2] ?: self::FALSY_VALUE);
                 }
                 continue;
@@ -1108,6 +1120,26 @@ class MoSQL
         return $this->proxyDirect('whereOneBy', [$field, $value]);
     }
 
+    /**
+     * Ajoute une ou plusieurs conditions WHERE
+     * 
+     * @param array|string $field Nom du champ ou tableau de conditions
+     * @param mixed $value Valeur à rechercher (si $field est une chaîne)
+     * @return self
+     * 
+     * @example
+     * $users->whereOneBy('email', 'john@example.com')->findOne();
+     * $users->whereOneBy(['email' => 'john@example.com', 'status' => 'active'])->findOne();
+     */
+    public function whereOneBy($field, $value = null): self
+    {
+        if (is_array($field)) {
+            return $this->proxyDirect('whereOneBy', [$field]);
+        }
+
+        return $this->proxyDirect('whereOneBy', [$field, $value]);
+    }
+
     // ================================================================
     // 11. EXÉCUTION
     // ================================================================
@@ -1135,6 +1167,8 @@ class MoSQL
         $results = $this->documentManager->hydrateAll($results);
 
         $executionTime = microtime(true) - $startTime;
+        $this->sqlFileCacheManager->set($cacheKey, $results, $executionTime);
+        $this->log($executionTime);
         $this->sqlFileCacheManager->set($cacheKey, $results, $executionTime);
         $this->log($executionTime);
 
@@ -1299,7 +1333,9 @@ class MoSQL
 
     /**
      * Trouve un document par son ID
+     * Trouve un document par son ID
      * 
+     * @param string|null $id ID du document
      * @param string|null $id ID du document
      * @return array|null Le document ou null
      * 
@@ -1307,11 +1343,14 @@ class MoSQL
      * $user = $users->find('A7kR9qW2');
      */
     public function find(string|null $id): ?array
+    public function find(string|null $id): ?array
     {
         if ($this->collection === '*') {
             return $this->findInAllCollections($id);
+            return $this->findInAllCollections($id);
         }
 
+        $cached = $this->cacheManager->get("document_uid_{$id}");
         $cached = $this->cacheManager->get("document_uid_{$id}");
         if ($cached !== null) {
             return $cached;
@@ -1319,7 +1358,9 @@ class MoSQL
 
         $this->reset();
         $result = $this->where('uid', '=', $id)->fetchOne();
+        $result = $this->where('uid', '=', $id)->fetchOne();
         if ($result) {
+            $this->cacheManager->set("document_uid_{$id}", $result);
             $this->cacheManager->set("document_uid_{$id}", $result);
         }
         return $result;
@@ -1329,8 +1370,10 @@ class MoSQL
      * Cherche un document dans toutes les collections
      * 
      * @param string $id ID du document
+     * @param string $id ID du document
      * @return array|null Le document avec sa collection ou null
      */
+    private function findInAllCollections(string $id): ?array
     private function findInAllCollections(string $id): ?array
     {
         $sm = $this->connection->createSchemaManager();
@@ -1348,6 +1391,7 @@ class MoSQL
                     ->select('*')
                     ->from($tableName)
                     ->where('uid = :uid')
+                    ->setParameter('uid', $id)
                     ->setParameter('uid', $id)
                     ->executeQuery()
                     ->fetchAssociative();
@@ -1368,13 +1412,16 @@ class MoSQL
      * Trouve un document dans plusieurs collections
      * 
      * @param string $id ID du document
+     * @param string $id ID du document
      * @param array $collections Liste des collections
      * @return array|null Le document ou null
      */
     public function findInCollections(string $id, array $collections): ?array
+    public function findInCollections(string $id, array $collections): ?array
     {
         foreach ($collections as $collection) {
             $db = new MoSQL($collection, $this->connection->getParams());
+            $result = $db->find($id);
             $result = $db->find($id);
             if ($result) {
                 $result['_collection'] = $collection;
@@ -1386,15 +1433,20 @@ class MoSQL
 
     /**
      * Trouve un document par ID ou lance une exception
+     * Trouve un document par ID ou lance une exception
      * 
+     * @param string $id ID du document
      * @param string $id ID du document
      * @return array Le document
      * @throws DocumentNotFoundException
      */
     public function findOrFail(string $id): array
+    public function findOrFail(string $id): array
     {
         $result = $this->find($id);
+        $result = $this->find($id);
         if ($result === null) {
+            throw new DocumentNotFoundException("Document with ID '{$id}' not found");
             throw new DocumentNotFoundException("Document with ID '{$id}' not found");
         }
         return $result;
@@ -1418,6 +1470,7 @@ class MoSQL
 
         $this->reset();
         $result = $this->where('uid', '=', $id)->fetchOne();
+        $result = $this->where('uid', '=', $id)->fetchOne();
         if ($result) {
             $this->cacheManager->set("document_id_{$id}", $result);
         }
@@ -1426,7 +1479,9 @@ class MoSQL
 
     /**
      * Trouve un document par ID ou ID
+     * Trouve un document par ID ou ID
      * 
+     * @param string|int $identifier ID ou ID
      * @param string|int $identifier ID ou ID
      * @return array|null Le document ou null
      */
@@ -1556,6 +1611,9 @@ class MoSQL
         $results = $this->select(['uid', 'id'])->fetchAll();
 
         return array_column($results, 'id');
+        $results = $this->select(['uid', 'id'])->fetchAll();
+
+        return array_column($results, 'id');
     }
 
     /**
@@ -1587,6 +1645,9 @@ class MoSQL
         $results = $this->select(['uid', 'id'])->fetchAll();
 
         $uids = array_column($results, 'id');
+        $results = $this->select(['uid', 'id'])->fetchAll();
+
+        $uids = array_column($results, 'id');
 
         shuffle($uids);
 
@@ -1604,6 +1665,9 @@ class MoSQL
      */
     public function findIDsFromQuery(): array
     {
+        $results = $this->select(['uid', 'id'])->fetchAll();
+
+        return array_column($results, 'id');
         $results = $this->select(['uid', 'id'])->fetchAll();
 
         return array_column($results, 'id');
@@ -1653,11 +1717,14 @@ class MoSQL
      * 
      * @param array $document Données du document
      * @return array $document généré
+     * @return array $document généré
      * @throws DuplicateException
      * 
      * @example
      * $id = $users->insert(['name' => 'Alice', 'email' => 'alice@example.com']);
+     * $id = $users->insert(['name' => 'Alice', 'email' => 'alice@example.com']);
      */
+    public function insert(array $document): array
     public function insert(array $document): array
     {
         if (!isset($document['uid'])) {
@@ -1667,12 +1734,14 @@ class MoSQL
         $existing = $this->findIdByUid($document['uid']);
         if ($existing !== null) {
             throw new DuplicateException("ID '{$document['uid']}' already exists");
+            throw new DuplicateException("ID '{$document['uid']}' already exists");
         }
 
         try {
             $id = $this->documentManager->insert($document);
             $this->uidCache[$document['uid']] = $id;
             $this->cacheManager->clear();
+            return $document;
             return $document;
         } catch (\Exception $e) {
             throw new DatabaseException($e->getMessage(), 0, $e);
@@ -1711,10 +1780,12 @@ class MoSQL
      * 
      * @param array $data Données à mettre à jour
      * @return array $results Tous les documents mis à jour
+     * @return array $results Tous les documents mis à jour
      * 
      * @example
      * $users->where('age', '<', 18)->update(['status' => 'minor']);
      */
+    public function update(array $data): array
     public function update(array $data): array
     {
         $conditions = [];
@@ -1752,13 +1823,29 @@ class MoSQL
 
         try {
             $results = $this->documentManager->update($data, $conditions);
+            $results = $this->documentManager->update($data, $conditions);
             $this->cacheManager->clear();
+            return $results;
             return $results;
         } catch (\Exception $e) {
             throw new DatabaseException($e->getMessage(), 0, $e);
         }
     }
 
+    /**
+     * Met à jour un document par son ID
+     * 
+     * @param string $id ID du document
+     * @param array $data Données à mettre à jour
+     * @return array Document mis à jour
+     */
+    public function updateByUid(string $id, array $data): array
+    {
+        $this->reset();
+        $this->where('uid', '=', $id);
+        $data['uid'] = $id;
+        return $this->update($data);
+    }
     // /**
     //  * Met à jour un document par son ID
     //  * 
@@ -1780,10 +1867,13 @@ class MoSQL
      * @param int $id ID du document
      * @param array $data Données à mettre à jour
      * @return array Document mis à jour
+     * @return array Document mis à jour
      */
+    public function updateById(int $id, array $data): array
     public function updateById(int $id, array $data): array
     {
         $this->reset();
+        $this->where('uid', '=', $id);
         $this->where('uid', '=', $id);
         $data['id'] = $id;
         return $this->update($data);
@@ -1794,7 +1884,9 @@ class MoSQL
      * 
      * @param array $data Données du document
      * @return array Document mis à jour
+     * @return array Document mis à jour
      */
+    public function upsert(array $data): array
     public function upsert(array $data): array
     {
         if (isset($data['uid'])) {
@@ -1812,6 +1904,7 @@ class MoSQL
      * 
      * @param array $documents Liste des documents
      * @return array Liste des documents mis à jour
+     * @return array Liste des documents mis à jour
      */
     public function upsertMany(array $documents): array
     {
@@ -1819,6 +1912,7 @@ class MoSQL
         foreach ($documents as $doc) {
             $uids[] = $this->upsert($doc);
         }
+        return $documents;
         return $documents;
     }
 
@@ -1926,6 +2020,8 @@ class MoSQL
         if ($hasJsonCondition) {
             $results = $this->select(['uid', 'id'])->fetchAll();
 
+            $results = $this->select(['uid', 'id'])->fetchAll();
+
             $ids = array_column($results, 'id');
 
             if (empty($ids)) {
@@ -1957,13 +2053,17 @@ class MoSQL
 
     /**
      * Supprime un document par son ID
+     * Supprime un document par son ID
      * 
+     * @param string $id ID du document
      * @param string $id ID du document
      * @return int Nombre de lignes supprimées
      */
     public function deleteByUid(string $id): int
+    public function deleteByUid(string $id): int
     {
         $this->reset();
+        $this->where('uid', '=', $id);
         $this->where('uid', '=', $id);
         return $this->delete();
     }
@@ -1977,6 +2077,7 @@ class MoSQL
     public function deleteById(int $id): int
     {
         $this->reset();
+        $this->where('uid', '=', $id);
         $this->where('uid', '=', $id);
         return $this->delete();
     }
@@ -2128,6 +2229,7 @@ class MoSQL
      * Invalide le cache d'un document
      * 
      * @param string|int $identifier ID ou ID du document
+     * @param string|int $identifier ID ou ID du document
      * @return self
      */
     public function invalidate(string|int $identifier): self
@@ -2149,23 +2251,31 @@ class MoSQL
 
     // ================================================================
     // 20. CONVERSION ID ↔ ID
+    // 20. CONVERSION ID ↔ ID
     // ================================================================
 
     /**
      * Trouve l'ID auto-incrémenté à partir d'un ID
+     * Trouve l'ID auto-incrémenté à partir d'un ID
      * 
+     * @param string $id ID du document
      * @param string $id ID du document
      * @return int|null ID ou null
      */
     public function findIdByUid(string $id): ?int
+    public function findIdByUid(string $id): ?int
     {
+        if (isset($this->uidCache[$id])) {
+            return $this->uidCache[$id];
         if (isset($this->uidCache[$id])) {
             return $this->uidCache[$id];
         }
 
         $this->reset();
         $result = $this->where('uid', '=', $id)->select(['uid', 'id'])->fetchOne();
+        $result = $this->where('uid', '=', $id)->select(['uid', 'id'])->fetchOne();
         if ($result) {
+            $this->uidCache[$id] = (int)$result['id'];
             $this->uidCache[$id] = (int)$result['id'];
             return (int)$result['id'];
         }
@@ -2174,13 +2284,17 @@ class MoSQL
 
     /**
      * Trouve l'ID à partir d'un ID
+     * Trouve l'ID à partir d'un ID
      * 
      * @param int $id ID du document
+     * @return string|null ID ou null
      * @return string|null ID ou null
      */
     public function findUidById(int $id): ?string
     {
         $this->reset();
+        $result = $this->where('uid', '=', $id)->select(['uid', 'id'])->fetchOne();
+        return $result['id'] ?? null;
         $result = $this->where('uid', '=', $id)->select(['uid', 'id'])->fetchOne();
         return $result['id'] ?? null;
     }
@@ -2799,6 +2913,7 @@ class MoSQL
     }
 
     /**
+     * Sauvegarde la requête dans le log
      * Extrait les mots d'une chaîne de recherche
      * 
      * @param string $query Chaîne de recherche
@@ -2824,6 +2939,7 @@ class MoSQL
      * @param float|null $executionTime Temps d'exécution
      * @return void
      */
+    private function log($executionTime = null): void
     private function log($executionTime = null): void
     {
         $dirname = dirname(__DIR__, 4);
