@@ -20,6 +20,14 @@ class SchemaManager
     private bool $autoCreate;
     private array $schema = [];
 
+    /**
+     * Colonnes "cœur" gérées par le framework lui-même (pas par l'utilisateur).
+     * Elles sont volontairement exclues de adaptSchema() car elles ont un
+     * typage et des valeurs par défaut spécifiques (ex: CURRENT_TIMESTAMP),
+     * donc on ne peut pas les déduire via TypeGuesser comme un champ métier.
+     */
+    private const CORE_COLUMNS = ['id', 'uid', 'created_at', 'updated_at', 'coll_name'];
+
     public function __construct(Connection $connection, string $collection, array $options = [])
     {
         $this->connection = $connection;
@@ -36,6 +44,14 @@ class SchemaManager
                 $this->createTable();
             }
             $this->loadSchema();
+
+            // La table existait peut-être déjà avant l'introduction de ce
+            // framework (ou d'une version antérieure), sans les colonnes
+            // "cœur" attendues. adaptSchema() les exclut volontairement,
+            // donc un simple insert ne les créera jamais : on les répare ici.
+            if ($this->autoCreate) {
+                $this->ensureCoreColumns();
+            }
         } catch (\Exception $e) {
             throw new SchemaException("Failed to ensure table exists: " . $e->getMessage(), 0, $e);
         }
@@ -71,6 +87,85 @@ class SchemaManager
         $sm->createTable($table);
     }
 
+    /**
+     * Auto-répare une table déjà existante à laquelle il manquerait des
+     * colonnes "cœur" (created_at, updated_at, coll_name). N'agit que si
+     * une colonne manque réellement, donc coût quasi nul sur une table déjà
+     * complète (juste une comparaison en mémoire sur $this->schema, déjà
+     * chargé par loadSchema()).
+     *
+     * Note : 'id' et 'uid' ne sont volontairement PAS auto-réparées ici,
+     * car ce sont la clé primaire et une contrainte d'unicité — les ajouter
+     * après coup sur une table qui contient déjà des lignes est risqué
+     * (valeurs à backfiller, contrainte UNIQUE à satisfaire) et doit être
+     * fait via une vraie migration, pas silencieusement au runtime.
+     */
+    private function ensureCoreColumns(): void
+    {
+        $missing = [];
+
+        if (!isset($this->schema['created_at'])) {
+            $missing['created_at'] = ['type' => Types::DATETIME_MUTABLE, 'options' => ['notnull' => false]];
+        }
+
+        if (!isset($this->schema['updated_at'])) {
+            $missing['updated_at'] = ['type' => Types::DATETIME_MUTABLE, 'options' => ['notnull' => false]];
+        }
+
+        if ($this->tableName !== '*' && !isset($this->schema['coll_name'])) {
+            $missing['coll_name'] = ['type' => Types::STRING, 'options' => ['length' => 100, 'notnull' => false]];
+        }
+
+        if (empty($missing)) {
+            return;
+        }
+
+        foreach ($missing as $name => $config) {
+            $this->addCoreColumn($name, $config['type'], $config['options']);
+        }
+
+        $this->loadSchema();
+    }
+
+    /**
+     * Ajoute une colonne "cœur" via ALTER TABLE, avec un DEFAULT
+     * CURRENT_TIMESTAMP pour les colonnes datetime (created_at/updated_at).
+     * Tolère une erreur "colonne déjà existante" pour rester safe en cas de
+     * requêtes concurrentes qui tenteraient la même réparation en parallèle.
+     */
+    private function addCoreColumn(string $name, string $dbalTypeName, array $options = []): void
+    {
+        try {
+            $type = Type::getType($dbalTypeName);
+            $platform = $this->connection->getDatabasePlatform();
+            $sqlDeclaration = $type->getSQLDeclaration($options, $platform);
+
+            $default = $dbalTypeName === Types::DATETIME_MUTABLE ? ' DEFAULT CURRENT_TIMESTAMP' : '';
+
+            $this->connection->executeStatement(sprintf(
+                'ALTER TABLE %s ADD COLUMN %s %s%s',
+                $this->connection->quoteIdentifier($this->tableName),
+                $this->connection->quoteIdentifier($name),
+                $sqlDeclaration,
+                $default
+            ));
+        } catch (\Exception $e) {
+            // Colonne déjà ajoutée entre-temps (course concurrente) : on
+            // ignore, loadSchema() rechargera l'état réel juste après.
+            if (!$this->isDuplicateColumnError($e)) {
+                throw $e;
+            }
+        }
+    }
+
+    private function isDuplicateColumnError(\Exception $e): bool
+    {
+        $message = $e->getMessage();
+        return stripos($message, 'duplicate column') !== false
+            || stripos($message, 'already exists') !== false
+            || str_contains($message, '1060'); // MySQL: Duplicate column name
+    }
+
     public function adaptSchema(array $document): void
     {
         if (!$this->autoCreate) {
@@ -89,7 +184,7 @@ class SchemaManager
 
             $columnsToAdd = [];
             foreach ($document as $field => $value) {
-                if (in_array($field, ['id', 'uid', 'created_at', 'updated_at'])) {
+                if (in_array($field, self::CORE_COLUMNS)) {
                     continue;
                 }
                 if (!isset($existingColumns[$field])) {

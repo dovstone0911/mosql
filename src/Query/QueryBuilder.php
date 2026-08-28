@@ -6,26 +6,8 @@ use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\Query\QueryBuilder as DBALQueryBuilder;
 use Dovstone\MoSQL\Schema\SchemaManager;
 
-/**
- * QueryBuilder - Constructeur de requêtes SQL avec support JSON, sous-requêtes et conditions avancées
- * 
- * @package Dovstone\MoSQL\Query
- * @author Dovstone
- * 
- * @example
- * $qb = new QueryBuilder($connection, $schemaManager);
- * $results = $qb->where('status', '=', 'active')
- *               ->orderBy('created_at', 'DESC')
- *               ->limit(10)
- *               ->build()
- *               ->fetchAllAssociative();
- */
 class QueryBuilder
 {
-    // ================================================================
-    // PROPRIÉTÉS
-    // ================================================================
-
     private Connection $connection;
     private SchemaManager $schemaManager;
 
@@ -37,10 +19,8 @@ class QueryBuilder
     private array $joins = [];
     private array $groups = [];
 
-    // Gestion des groupes imbriqués
     private array $groupStack = ['AND'];
 
-    // Propriétés avancées
     private ?array $orderByField = null;
     private ?array $orderByRaw = null;
     private int $conditionCounter = 0;
@@ -49,12 +29,12 @@ class QueryBuilder
     private array $rawConditions = [];
     private array $subConditions = [];
 
-    // Cache du schéma pour éviter les appels répétés
     private ?array $schemaCache = null;
+    private ?array $schemaColumnsCache = null;
 
-    // ================================================================
-    // CONSTRUCTEUR
-    // ================================================================
+    // Cache des colonnes réellement présentes en base (introspection physique),
+    // distinct du schéma déclaré qui peut contenir des colonnes pas encore créées.
+    private ?array $physicalColumnsCache = null;
 
     public function __construct(Connection $connection, SchemaManager $schemaManager)
     {
@@ -63,26 +43,113 @@ class QueryBuilder
     }
 
     // ================================================================
-    // 1. CONDITIONS DE BASE
+    // MÉTHODES DE SCHÉMA
     // ================================================================
 
     /**
-     * Ajoute une condition WHERE
-     * 
-     * @param string $field Nom du champ
-     * @param string $operator Opérateur (=, !=, >, <, >=, <=, LIKE, IS NULL, etc.)
-     * @param mixed $value Valeur à comparer
-     * @return self
-     * 
-     * @example
-     * $qb->where('status', '=', 'active');
-     * $qb->where('age', '>', 18);
-     * $qb->where('user.profile.age', '>', 18); // JSON path
+     * Colonnes "sûres" à utiliser dans une requête : intersection entre le
+     * schéma déclaré (SchemaManager) et les colonnes réellement présentes
+     * dans la table en base. Évite les "Column not found" quand une colonne
+     * a été déclarée mais pas encore matérialisée (ex: auto-création différée
+     * jusqu'au premier insert).
      */
+    public function getExistingColumns(): array
+    {
+        if ($this->schemaColumnsCache === null) {
+            $declared = array_keys($this->schemaManager->getSchema());
+            $physical = $this->getPhysicalColumns();
+
+            if (empty($physical)) {
+                // Table absente ou introspection impossible : on ne peut pas
+                // garantir la présence des colonnes déclarées, on renvoie donc
+                // une liste vide plutôt que de risquer une erreur SQL.
+                $this->schemaColumnsCache = [];
+            } else {
+                $this->schemaColumnsCache = array_values(array_intersect($declared, $physical));
+            }
+        }
+        return $this->schemaColumnsCache;
+    }
+
+    /**
+     * Retourne les colonnes réellement présentes dans la table, via
+     * introspection DBAL. Mise en cache pour la durée de vie de l'instance.
+     */
+    private function getPhysicalColumns(): array
+    {
+        if ($this->physicalColumnsCache === null) {
+            $tableName = $this->schemaManager->getTableName();
+
+            try {
+                $sm = $this->connection->createSchemaManager();
+                if ($sm->tablesExist([$tableName])) {
+                    $this->physicalColumnsCache = array_map(
+                        static fn($col) => $col->getName(),
+                        $sm->listTableColumns($tableName)
+                    );
+                } else {
+                    $this->physicalColumnsCache = [];
+                }
+            } catch (\Exception $e) {
+                // En cas d'échec d'introspection, on considère qu'on n'a
+                // aucune garantie sur les colonnes disponibles.
+                $this->physicalColumnsCache = [];
+            }
+        }
+
+        return $this->physicalColumnsCache;
+    }
+
+    public function hasColumn(string $field): bool
+    {
+        $field = $this->normalizeField($field);
+        return in_array($field, $this->getExistingColumns());
+    }
+
+    public function filterValidColumns(array $fields): array
+    {
+        $existing = $this->getExistingColumns();
+        return array_intersect($fields, $existing);
+    }
+
+    /**
+     * Invalide les caches de schéma (déclaré + physique). À appeler si l'on
+     * sait que la structure de la table vient de changer (ex: après un
+     * insert qui a déclenché une auto-création de colonne) et que l'on
+     * réutilise la même instance de QueryBuilder pour une requête suivante.
+     */
+    public function refreshSchemaCache(): self
+    {
+        $this->schemaColumnsCache = null;
+        $this->physicalColumnsCache = null;
+        $this->schemaCache = null;
+        return $this;
+    }
+
+    private function isExpression(string $field): bool
+    {
+        $expressions = ['DATE', 'MONTH', 'YEAR', 'DAY', 'HOUR', 'MINUTE', 'SOUNDEX', 'JSON', 'NOW', 'CURRENT'];
+        $upper = strtoupper($field);
+        foreach ($expressions as $expr) {
+            if (strpos($upper, $expr) === 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ================================================================
+    // CONDITIONS DE BASE
+    // ================================================================
+
     public function where(string $field, string $operator, mixed $value): self
     {
         $field = $this->normalizeField($field);
         $operator = strtoupper($operator);
+
+        if (!$this->isExpression($field) && !$this->hasColumn($field)) {
+            return $this;
+        }
 
         if ($this->isJsonPath($field)) {
             return $this->addJsonCondition($field, $operator, $value);
@@ -91,14 +158,6 @@ class QueryBuilder
         return $this->addCondition($field, $operator, $value);
     }
 
-    /**
-     * Ajoute une condition WHERE avec OR
-     * 
-     * @param string $field Nom du champ
-     * @param string $operator Opérateur
-     * @param mixed $value Valeur
-     * @return self
-     */
     public function orWhere(string $field, string $operator, mixed $value): self
     {
         $this->pushGroup('OR');
@@ -107,12 +166,6 @@ class QueryBuilder
         return $result;
     }
 
-    /**
-     * Ajoute un groupe de conditions avec AND
-     * 
-     * @param callable $callback Fonction qui reçoit un QueryBuilder
-     * @return self
-     */
     public function andWhere(callable $callback): self
     {
         $this->pushGroup('AND');
@@ -133,12 +186,6 @@ class QueryBuilder
         return $this;
     }
 
-    /**
-     * Ajoute un groupe de conditions avec OR
-     * 
-     * @param callable $callback Fonction qui reçoit un QueryBuilder
-     * @return self
-     */
     public function orWhereGroup(callable $callback): self
     {
         $this->pushGroup('OR');
@@ -159,17 +206,41 @@ class QueryBuilder
         return $this;
     }
 
+    public function whereOneBy($field, $value = null): self
+    {
+        if (is_array($field)) {
+            foreach ($field as $key => $val) {
+                if ($this->hasColumn($key)) {
+                    $this->where($key, '=', $val);
+                }
+            }
+            return $this;
+        }
+
+        if ($this->hasColumn($field)) {
+            $this->where($field, '=', $value);
+        }
+
+        return $this;
+    }
+
+    public function orWhereLike(string $field, string $pattern): self
+    {
+        return $this->orWhere($field, 'LIKE', $pattern);
+    }
+
+    public function andWhereLike(string $field, string $pattern): self
+    {
+        $this->pushGroup('AND');
+        $this->whereLike($field, $pattern);
+        $this->popGroup();
+        return $this;
+    }
+
     // ================================================================
-    // 2. CONDITIONS SPÉCIALES (IN, LIKE, BETWEEN, NULL)
+    // CONDITIONS SPÉCIALES
     // ================================================================
 
-    /**
-     * Ajoute une condition WHERE IN
-     * 
-     * @param string $field Nom du champ
-     * @param array $values Liste des valeurs
-     * @return self
-     */
     public function whereIn(string $field, array $values): self
     {
         if (empty($values)) {
@@ -178,6 +249,10 @@ class QueryBuilder
 
         $field = $this->normalizeField($field);
 
+        if (!$this->hasColumn($field)) {
+            return $this;
+        }
+
         if ($this->isJsonColumn($field)) {
             return $this->addJsonInCondition($field, $values);
         }
@@ -185,13 +260,6 @@ class QueryBuilder
         return $this->addCondition($field, 'IN', $values);
     }
 
-    /**
-     * Ajoute une condition WHERE NOT IN
-     * 
-     * @param string $field Nom du champ
-     * @param array $values Liste des valeurs
-     * @return self
-     */
     public function whereNotIn(string $field, array $values): self
     {
         if (empty($values)) {
@@ -199,6 +267,10 @@ class QueryBuilder
         }
 
         $field = $this->normalizeField($field);
+
+        if (!$this->hasColumn($field)) {
+            return $this;
+        }
 
         if ($this->isJsonColumn($field)) {
             foreach ($values as $value) {
@@ -210,88 +282,40 @@ class QueryBuilder
         return $this->addCondition($field, 'NOT IN', $values);
     }
 
-    /**
-     * Ajoute une condition WHERE LIKE
-     * 
-     * @param string $field Nom du champ
-     * @param string $pattern Motif de recherche
-     * @return self
-     */
     public function whereLike(string $field, string $pattern): self
     {
         return $this->where($field, 'LIKE', $pattern);
     }
 
-    /**
-     * Ajoute une condition WHERE BETWEEN
-     * 
-     * @param string $field Nom du champ
-     * @param mixed $min Valeur minimale
-     * @param mixed $max Valeur maximale
-     * @return self
-     */
     public function whereBetween(string $field, mixed $min, mixed $max): self
     {
         return $this->where($field, 'BETWEEN', [$min, $max]);
     }
 
-    /**
-     * Ajoute une condition WHERE IS NULL
-     * 
-     * @param string $field Nom du champ
-     * @return self
-     */
     public function whereNull(string $field): self
     {
         return $this->where($field, 'IS NULL', null);
     }
 
-    /**
-     * Ajoute une condition WHERE IS NOT NULL
-     * 
-     * @param string $field Nom du champ
-     * @return self
-     */
     public function whereNotNull(string $field): self
     {
         return $this->where($field, 'IS NOT NULL', null);
     }
 
     // ================================================================
-    // 3. CONDITIONS JSON
+    // CONDITIONS JSON
     // ================================================================
 
-    /**
-     * Ajoute une condition WHERE JSON_CONTAINS
-     * 
-     * @param string $field Nom du champ JSON
-     * @param string $value Valeur JSON à chercher
-     * @return self
-     */
     public function whereJsonContains(string $field, string $value): self
     {
         return $this->addJsonCondition($field, 'JSON_CONTAINS', $value);
     }
 
-    /**
-     * Ajoute une condition WHERE JSON_NOT_CONTAINS
-     * 
-     * @param string $field Nom du champ JSON
-     * @param string $value Valeur JSON à chercher
-     * @return self
-     */
     public function whereJsonNotContains(string $field, string $value): self
     {
         return $this->addJsonCondition($field, 'JSON_NOT_CONTAINS', $value);
     }
 
-    /**
-     * Ajoute une condition WHERE JSON_CONTAINS avec OR
-     * 
-     * @param string $field Nom du champ JSON
-     * @param string $value Valeur JSON à chercher
-     * @return self
-     */
     public function orWhereJsonContains(string $field, string $value): self
     {
         $this->pushGroup('OR');
@@ -300,13 +324,6 @@ class QueryBuilder
         return $result;
     }
 
-    /**
-     * Ajoute une condition WHERE JSON_NOT_CONTAINS avec OR
-     * 
-     * @param string $field Nom du champ JSON
-     * @param string $value Valeur JSON à chercher
-     * @return self
-     */
     public function orWhereJsonNotContains(string $field, string $value): self
     {
         $this->pushGroup('OR');
@@ -315,13 +332,6 @@ class QueryBuilder
         return $result;
     }
 
-    /**
-     * WHERE JSON_CONTAINS avec OR entre les valeurs
-     * 
-     * @param string $field Nom du champ JSON
-     * @param array $values Liste des valeurs
-     * @return self
-     */
     public function whereJsonContainsAny(string $field, array $values): self
     {
         if (empty($values)) {
@@ -336,13 +346,6 @@ class QueryBuilder
         return $this;
     }
 
-    /**
-     * WHERE JSON_NOT_CONTAINS avec OR entre les valeurs
-     * 
-     * @param string $field Nom du champ JSON
-     * @param array $values Liste des valeurs
-     * @return self
-     */
     public function whereJsonNotContainsAny(string $field, array $values): self
     {
         if (empty($values)) {
@@ -357,13 +360,6 @@ class QueryBuilder
         return $this;
     }
 
-    /**
-     * WHERE JSON_CONTAINS avec AND entre les valeurs
-     * 
-     * @param string $field Nom du champ JSON
-     * @param array $values Liste des valeurs
-     * @return self
-     */
     public function whereJsonContainsAll(string $field, array $values): self
     {
         foreach ($values as $value) {
@@ -372,13 +368,6 @@ class QueryBuilder
         return $this;
     }
 
-    /**
-     * WHERE JSON_NOT_CONTAINS avec AND entre les valeurs
-     * 
-     * @param string $field Nom du champ JSON
-     * @param array $values Liste des valeurs
-     * @return self
-     */
     public function whereJsonNotContainsAll(string $field, array $values): self
     {
         foreach ($values as $value) {
@@ -388,98 +377,43 @@ class QueryBuilder
     }
 
     // ================================================================
-    // 4. CONDITIONS DE DATE/TEMPS
+    // CONDITIONS DE DATE/TEMPS
     // ================================================================
 
-    /**
-     * Ajoute une condition WHERE sur une date
-     * 
-     * @param string $field Nom du champ
-     * @param string $operator Opérateur
-     * @param string $date Date (format Y-m-d)
-     * @return self
-     */
     public function whereDate(string $field, string $operator, string $date): self
     {
         return $this->where("DATE($field)", $operator, $date);
     }
 
-    /**
-     * Ajoute une condition WHERE sur le mois
-     * 
-     * @param string $field Nom du champ
-     * @param string $operator Opérateur
-     * @param int $month Mois (1-12)
-     * @return self
-     */
     public function whereMonth(string $field, string $operator, int $month): self
     {
         return $this->where("MONTH($field)", $operator, $month);
     }
 
-    /**
-     * Ajoute une condition WHERE sur l'année
-     * 
-     * @param string $field Nom du champ
-     * @param string $operator Opérateur
-     * @param int $year Année
-     * @return self
-     */
     public function whereYear(string $field, string $operator, int $year): self
     {
         return $this->where("YEAR($field)", $operator, $year);
     }
 
-    /**
-     * Ajoute une condition WHERE sur le jour
-     * 
-     * @param string $field Nom du champ
-     * @param string $operator Opérateur
-     * @param int $day Jour (1-31)
-     * @return self
-     */
     public function whereDay(string $field, string $operator, int $day): self
     {
         return $this->where("DAY($field)", $operator, $day);
     }
 
-    /**
-     * Ajoute une condition WHERE sur l'heure
-     * 
-     * @param string $field Nom du champ
-     * @param string $operator Opérateur
-     * @param int $hour Heure (0-23)
-     * @return self
-     */
     public function whereHour(string $field, string $operator, int $hour): self
     {
         return $this->where("HOUR($field)", $operator, $hour);
     }
 
-    /**
-     * Ajoute une condition WHERE sur la minute
-     * 
-     * @param string $field Nom du champ
-     * @param string $operator Opérateur
-     * @param int $minute Minute (0-59)
-     * @return self
-     */
     public function whereMinute(string $field, string $operator, int $minute): self
     {
         return $this->where("MINUTE($field)", $operator, $minute);
     }
 
     // ================================================================
-    // 5. CONDITIONS AVANCÉES (RAW, SUBQUERY)
+    // CONDITIONS AVANCÉES
     // ================================================================
 
-    /**
-     * Ajoute une condition WHERE avec SQL brut
-     * 
-     * @param string $sql SQL brut
-     * @param array $params Paramètres
-     * @return self
-     */
     public function whereRaw(string $sql, array $params = []): self
     {
         $this->rawConditions[] = [
@@ -490,14 +424,6 @@ class QueryBuilder
         return $this;
     }
 
-    /**
-     * Ajoute une condition WHERE avec sous-requête
-     * 
-     * @param string $field Nom du champ
-     * @param string $operator Opérateur
-     * @param callable $callback Callback construisant la sous-requête
-     * @return self
-     */
     public function whereSub(string $field, string $operator, callable $callback): self
     {
         $subQuery = new self($this->connection, $this->schemaManager);
@@ -517,50 +443,62 @@ class QueryBuilder
     }
 
     // ================================================================
-    // 6. PROJECTION ET TRI
+    // PROJECTION ET TRI
     // ================================================================
 
-    /**
-     * Définit les champs à sélectionner
-     * 
-     * @param array $fields Liste des champs
-     * @return self
-     */
     public function select(array $fields): self
     {
-        $this->projection = $fields;
+        if (empty($fields)) {
+            $this->projection = $this->getExistingColumns();
+            return $this;
+        }
+
+        $existingColumns = $this->getExistingColumns();
+        $validFields = [];
+
+        foreach ($fields as $field) {
+            if (in_array($field, $existingColumns)) {
+                $validFields[] = $field;
+            }
+        }
+
+        $required = ['uid', 'id', 'coll_name'];
+        foreach ($required as $col) {
+            if (in_array($col, $existingColumns) && !in_array($col, $validFields)) {
+                $validFields[] = $col;
+            }
+        }
+
+        $this->projection = array_unique($validFields);
         return $this;
     }
 
-    /**
-     * Ajoute un ORDER BY
-     * 
-     * @param string $field Nom du champ
-     * @param string $direction ASC ou DESC
-     * @return self
-     */
     public function orderBy(string $field, string $direction = 'ASC'): self
     {
-        $this->orderBy[] = [$this->normalizeField($field), strtoupper($direction)];
+        $field = $this->normalizeField($field);
+
+        if (!$this->hasColumn($field)) {
+            return $this;
+        }
+
+        $this->orderBy[] = [$field, strtoupper($direction)];
         return $this;
     }
 
-    /**
-     * ORDER BY avec FIELD() pour un ordre personnalisé
-     * 
-     * @param string $field Nom du champ
-     * @param array $values Valeurs dans l'ordre souhaité
-     * @param string $direction ASC ou DESC
-     * @return self
-     */
     public function orderByField(string $field, array $values, string $direction = 'ASC'): self
     {
         if (empty($values)) {
             return $this;
         }
 
+        $field = $this->normalizeField($field);
+
+        if (!$this->hasColumn($field)) {
+            return $this;
+        }
+
         $this->orderByField = [
-            'field' => $this->normalizeField($field),
+            'field' => $field,
             'values' => $values,
             'direction' => strtoupper($direction),
         ];
@@ -568,26 +506,12 @@ class QueryBuilder
         return $this;
     }
 
-    /**
-     * ORDER BY avec SQL brut
-     * 
-     * @param string $rawSql SQL brut
-     * @param array $params Paramètres
-     * @return self
-     */
     public function orderByRaw(string $rawSql, array $params = []): self
     {
         $this->orderByRaw = ['sql' => $rawSql, 'params' => $params];
         return $this;
     }
 
-    /**
-     * Définit la limite et l'offset
-     * 
-     * @param int $limit Nombre maximum de résultats
-     * @param int|null $offset Décalage
-     * @return self
-     */
     public function limit(int $limit, ?int $offset = null): self
     {
         $this->limit = max(0, $limit);
@@ -597,24 +521,12 @@ class QueryBuilder
         return $this;
     }
 
-    /**
-     * Définit l'offset
-     * 
-     * @param int $offset Décalage
-     * @return self
-     */
     public function offset(int $offset): self
     {
         $this->offset = max(0, $offset);
         return $this;
     }
 
-    /**
-     * Ajoute un GROUP BY
-     * 
-     * @param string|array $fields Champ(s) de regroupement
-     * @return self
-     */
     public function groupBy(string|array $fields): self
     {
         if (is_string($fields)) {
@@ -622,23 +534,24 @@ class QueryBuilder
         }
 
         foreach ($fields as $field) {
-            $this->groupBy[] = $this->normalizeField($field);
+            $field = $this->normalizeField($field);
+            if ($this->hasColumn($field)) {
+                $this->groupBy[] = $field;
+            }
         }
         return $this;
     }
 
-    /**
-     * Ajoute un HAVING
-     * 
-     * @param string $field Nom du champ
-     * @param string $operator Opérateur
-     * @param mixed $value Valeur
-     * @return self
-     */
     public function having(string $field, string $operator, mixed $value): self
     {
+        $field = $this->normalizeField($field);
+
+        if (!$this->hasColumn($field)) {
+            return $this;
+        }
+
         $this->having[] = [
-            'field' => $this->normalizeField($field),
+            'field' => $field,
             'operator' => $operator,
             'value' => $value,
         ];
@@ -646,19 +559,9 @@ class QueryBuilder
     }
 
     // ================================================================
-    // 7. JOINTURES
+    // JOINTURES
     // ================================================================
 
-    /**
-     * Ajoute une jointure
-     * 
-     * @param string $collection Nom de la collection
-     * @param string $localField Champ local
-     * @param string $operator Opérateur
-     * @param string $foreignField Champ étranger
-     * @param string $type Type de jointure (inner, left, right)
-     * @return self
-     */
     public function join(string $collection, string $localField, string $operator, string $foreignField, string $type = 'inner'): self
     {
         $this->joins[] = [
@@ -672,57 +575,21 @@ class QueryBuilder
         return $this;
     }
 
-    /**
-     * Alias de join avec type 'left'
-     * 
-     * @param string $collection Nom de la collection
-     * @param string $localField Champ local
-     * @param string $operator Opérateur
-     * @param string $foreignField Champ étranger
-     * @return self
-     */
     public function leftJoin(string $collection, string $localField, string $operator, string $foreignField): self
     {
         return $this->join($collection, $localField, $operator, $foreignField, 'left');
     }
 
-    /**
-     * Alias de join avec type 'inner'
-     * 
-     * @param string $collection Nom de la collection
-     * @param string $localField Champ local
-     * @param string $operator Opérateur
-     * @param string $foreignField Champ étranger
-     * @return self
-     */
     public function innerJoin(string $collection, string $localField, string $operator, string $foreignField): self
     {
         return $this->join($collection, $localField, $operator, $foreignField, 'inner');
     }
 
-    /**
-     * Alias de join avec type 'right'
-     * 
-     * @param string $collection Nom de la collection
-     * @param string $localField Champ local
-     * @param string $operator Opérateur
-     * @param string $foreignField Champ étranger
-     * @return self
-     */
     public function rightJoin(string $collection, string $localField, string $operator, string $foreignField): self
     {
         return $this->join($collection, $localField, $operator, $foreignField, 'right');
     }
 
-    /**
-     * Jointure complexe avec condition personnalisée
-     * 
-     * @param string $collection Nom de la collection
-     * @param string $onClause Condition de jointure
-     * @param string $type Type de jointure
-     * @param array $params Paramètres
-     * @return self
-     */
     public function joinComplex(string $collection, string $onClause, string $type = 'inner', array $params = []): self
     {
         $this->joins[] = [
@@ -736,61 +603,476 @@ class QueryBuilder
     }
 
     // ================================================================
-    // 8. GETTERS
+    // MÉTHODES DE RECHERCHE
     // ================================================================
 
-    public function getConditions(): array { return $this->conditions; }
-    public function getProjection(): array { return $this->projection; }
-    public function getOrderBy(): array { return $this->orderBy; }
-    public function getLimit(): ?int { return $this->limit; }
-    public function getOffset(): ?int { return $this->offset; }
-    public function getJoins(): array { return $this->joins; }
-    public function getGroups(): array { return $this->groups; }
-    public function getGroupBy(): array { return $this->groupBy; }
-    public function getHaving(): array { return $this->having; }
-    public function getRawConditions(): array { return $this->rawConditions; }
-    public function getSubConditions(): array { return $this->subConditions; }
-    public function getTableName(): string { return $this->schemaManager->getTableName(); }
-    public function getConnection(): Connection { return $this->connection; }
-    public function getSchemaManager(): SchemaManager { return $this->schemaManager; }
+    private function extractWords(string $query): array
+    {
+        $query = trim($query);
+        $query = preg_replace('/\s+/', ' ', $query);
+        $query = preg_replace('/[^\w\s\-@.]/u', '', $query);
+
+        $words = explode(' ', $query);
+        $words = array_filter($words, function ($word) {
+            return strlen($word) >= 2;
+        });
+
+        return array_values(array_unique($words));
+    }
+
+    private function getNumericFields(): array
+    {
+        $schema = $this->schemaManager->getSchema();
+        $fields = [];
+        $types = ['int', 'integer', 'float', 'decimal', 'double', 'numeric'];
+
+        foreach ($schema as $field => $config) {
+            if (in_array($config['type'] ?? 'string', $types) && $this->hasColumn($field)) {
+                $fields[] = $field;
+            }
+        }
+
+        return $fields;
+    }
+
+    private function getDateFields(): array
+    {
+        $schema = $this->schemaManager->getSchema();
+        $fields = [];
+        $types = ['date', 'datetime', 'timestamp', 'time', 'year'];
+
+        foreach ($schema as $field => $config) {
+            if (in_array($config['type'] ?? 'string', $types) && $this->hasColumn($field)) {
+                $fields[] = $field;
+            }
+        }
+
+        return $fields;
+    }
+
+    private function getTextFields(): array
+    {
+        $schema = $this->schemaManager->getSchema();
+        $fields = [];
+        $types = ['string', 'text', 'varchar', 'char', 'json'];
+
+        foreach ($schema as $field => $config) {
+            if (in_array($config['type'] ?? 'string', $types) && $this->hasColumn($field)) {
+                $fields[] = $field;
+            }
+        }
+
+        return $fields;
+    }
+
+    public function searchWord(string $word, array $fields): self
+    {
+        if (empty($word) || empty($fields)) {
+            return $this;
+        }
+
+        $this->pushGroup('OR');
+
+        foreach ($fields as $field) {
+            if ($this->hasColumn($field)) {
+                $this->whereLike($field, '%' . addcslashes($word, '%_\\') . '%');
+            }
+        }
+
+        $this->popGroup();
+        return $this;
+    }
+
+    public function searchWordOr(string $word, array $fields): self
+    {
+        return $this->searchWord($word, $fields);
+    }
+
+    public function searchByWords(array $words, array $fields): self
+    {
+        if (empty($words) || empty($fields)) {
+            return $this;
+        }
+
+        $this->pushGroup('OR');
+
+        foreach ($words as $word) {
+            $this->searchWord($word, $fields);
+        }
+
+        $this->popGroup();
+        return $this;
+    }
+
+    public function searchStrictByWords(array $words, array $fields): self
+    {
+        if (empty($words) || empty($fields)) {
+            return $this;
+        }
+
+        foreach ($words as $word) {
+            $this->searchWord($word, $fields);
+        }
+
+        return $this;
+    }
+
+    public function searchExact(string $query, array $fields): self
+    {
+        if (empty($query) || empty($fields)) {
+            return $this;
+        }
+
+        $this->pushGroup('OR');
+
+        foreach ($fields as $field) {
+            if ($this->hasColumn($field)) {
+                $this->whereLike($field, '%' . addcslashes($query, '%_\\') . '%');
+            }
+        }
+
+        $this->popGroup();
+        return $this;
+    }
+
+    public function searchFuzzy(string $query, array $fields, float $threshold = 0.7): self
+    {
+        $words = $this->extractWords($query);
+
+        if (empty($words) || empty($fields)) {
+            return $this;
+        }
+
+        $this->pushGroup('OR');
+
+        foreach ($words as $word) {
+            $this->pushGroup('OR');
+
+            foreach ($fields as $field) {
+                if ($this->hasColumn($field)) {
+                    $this->whereRaw("SOUNDEX($field) = SOUNDEX(?)", [$word]);
+                    $this->orWhereLike($field, '%' . addcslashes($word, '%_\\') . '%');
+                }
+            }
+
+            $this->popGroup();
+        }
+
+        $this->popGroup();
+        return $this;
+    }
+
+    public function searchWithScore(string $query, array $fields): self
+    {
+        $words = $this->extractWords($query);
+
+        if (empty($words) || empty($fields)) {
+            return $this;
+        }
+
+        $scoreParts = [];
+        $params = [];
+        $paramCount = 0;
+
+        foreach ($fields as $field => $weight) {
+            if (!$this->hasColumn($field)) {
+                continue;
+            }
+
+            foreach ($words as $word) {
+                $paramName = "search_{$paramCount}";
+                $scoreParts[] = "CASE 
+                    WHEN $field LIKE :{$paramName} 
+                    THEN $weight 
+                    ELSE 0 
+                END";
+                $params[$paramName] = '%' . addcslashes($word, '%_\\') . '%';
+                $paramCount++;
+            }
+        }
+
+        if (empty($scoreParts)) {
+            return $this;
+        }
+
+        $scoreSql = '(' . implode(' + ', $scoreParts) . ')';
+
+        $this->projection[] = "$scoreSql as score";
+        $this->orderBy('score', 'DESC');
+
+        foreach ($params as $key => $value) {
+            $this->rawConditions[] = [
+                'type' => 'raw',
+                'sql' => '1=1',
+                'params' => [$key => $value]
+            ];
+        }
+
+        return $this;
+    }
+
+    public function searchContext(array $textWords, array $numberWords, array $dateWords, array $fields = []): self
+    {
+        if (!empty($textWords)) {
+            if (!empty($fields)) {
+                $this->searchByWords($textWords, $fields);
+            } else {
+                $textFields = $this->getTextFields();
+                if (!empty($textFields)) {
+                    $this->searchByWords($textWords, $textFields);
+                }
+            }
+        }
+
+        if (!empty($numberWords)) {
+            $numberFields = $this->getNumericFields();
+            if (!empty($numberFields)) {
+                foreach ($numberWords as $number) {
+                    $this->pushGroup('OR');
+                    foreach ($numberFields as $field) {
+                        $this->where($field, '=', $number);
+                    }
+                    $this->popGroup();
+                }
+            }
+        }
+
+        if (!empty($dateWords)) {
+            $dateFields = $this->getDateFields();
+            if (!empty($dateFields)) {
+                foreach ($dateWords as $year) {
+                    $this->pushGroup('OR');
+                    foreach ($dateFields as $field) {
+                        $this->whereYear($field, '=', (int)$year);
+                    }
+                    $this->popGroup();
+                }
+            }
+        }
+
+        return $this;
+    }
+
+    public function search(string $query, array $fields, string $mode = 'loose'): self
+    {
+        if (empty($fields)) {
+            return $this;
+        }
+
+        switch ($mode) {
+            case 'strict':
+                $words = $this->extractWords($query);
+                if (!empty($words)) {
+                    $this->searchStrictByWords($words, $fields);
+                }
+                break;
+            case 'exact':
+                $this->searchExact($query, $fields);
+                break;
+            case 'fuzzy':
+                $this->searchFuzzy($query, $fields);
+                break;
+            case 'loose':
+            default:
+                $words = $this->extractWords($query);
+                if (!empty($words)) {
+                    $this->searchByWords($words, $fields);
+                }
+                break;
+        }
+
+        return $this;
+    }
 
     // ================================================================
-    // 9. BUILD & RESET
+    // PLUCK & FIND
     // ================================================================
 
-    /**
-     * Construit et retourne le QueryBuilder Doctrine
-     * 
-     * @return DBALQueryBuilder
-     */
+    public function pluck(string $field, $default = null)
+    {
+        if (!$this->hasColumn($field)) {
+            return $default;
+        }
+
+        $this->select([$field]);
+        $qb = $this->build();
+
+        try {
+            $result = $qb->executeQuery()->fetchOne();
+            return $result !== false ? $result : $default;
+        } catch (\Exception $e) {
+            return $default;
+        }
+    }
+
+    public function pluckOneBy(string $field, array $criteria = [], $default = null)
+    {
+        if (!$this->hasColumn($field)) {
+            return $default;
+        }
+
+        foreach ($criteria as $key => $value) {
+            if ($this->hasColumn($key)) {
+                $this->where($key, '=', $value);
+            }
+        }
+
+        return $this->pluck($field, $default);
+    }
+
+    // ================================================================
+    // GETTERS
+    // ================================================================
+
+    public function getConditions(): array
+    {
+        return $this->conditions;
+    }
+
+    public function getProjection(): array
+    {
+        return $this->projection;
+    }
+
+    public function getOrderBy(): array
+    {
+        return $this->orderBy;
+    }
+
+    public function getLimit(): ?int
+    {
+        return $this->limit;
+    }
+
+    public function getOffset(): ?int
+    {
+        return $this->offset;
+    }
+
+    public function getJoins(): array
+    {
+        return $this->joins;
+    }
+
+    public function getGroups(): array
+    {
+        return $this->groups;
+    }
+
+    public function getGroupBy(): array
+    {
+        return $this->groupBy;
+    }
+
+    public function getHaving(): array
+    {
+        return $this->having;
+    }
+
+    public function getRawConditions(): array
+    {
+        return $this->rawConditions;
+    }
+
+    public function getSubConditions(): array
+    {
+        return $this->subConditions;
+    }
+
+    public function getTableName(): string
+    {
+        return $this->schemaManager->getTableName();
+    }
+
+    public function getConnection(): Connection
+    {
+        return $this->connection;
+    }
+
+    public function getSchemaManager(): SchemaManager
+    {
+        return $this->schemaManager;
+    }
+
+    // ================================================================
+    // GESTION DES GROUPES
+    // ================================================================
+
+    public function pushGroup(string $type): self
+    {
+        $this->groupStack[] = $type;
+        return $this;
+    }
+
+    public function popGroup(): self
+    {
+        if (count($this->groupStack) > 1) {
+            array_pop($this->groupStack);
+        }
+        return $this;
+    }
+
+    public function getCurrentGroup(): string
+    {
+        return end($this->groupStack) ?: 'AND';
+    }
+
+    public function hasOpenGroups(): bool
+    {
+        return count($this->groupStack) > 1;
+    }
+
+    public function resetGroups(): self
+    {
+        $this->groupStack = ['AND'];
+        return $this;
+    }
+
+    // ================================================================
+    // BUILD & RESET
+    // ================================================================
+
     public function build(): DBALQueryBuilder
     {
         $qb = $this->connection->createQueryBuilder();
         $tableName = $this->schemaManager->getTableName();
 
-        // Projection
         if (empty($this->projection)) {
-            $qb->select('*');
+            $existingColumns = $this->getExistingColumns();
+            if (!empty($existingColumns)) {
+                $qb->select(implode(', ', $existingColumns));
+            } else {
+                // Si aucune colonne n'existe, sélectionner tout (mais cela peut échouer)
+                $qb->select('*');
+            }
         } else {
-            $qb->select(implode(', ', $this->projection));
+            $existingColumns = $this->getExistingColumns();
+            $validProjection = array_intersect($this->projection, $existingColumns);
+
+            if (empty($validProjection)) {
+                $qb->select(implode(', ', $existingColumns) ?: '*');
+            } else {
+                $qb->select(implode(', ', $validProjection));
+            }
         }
 
         $qb->from($tableName);
-
         $this->buildJoins($qb, $tableName);
         $this->buildWhere($qb);
         $this->buildOrderBy($qb);
 
-        // Group By
         foreach ($this->groupBy as $field) {
-            $qb->addGroupBy($field);
+            if ($this->hasColumn($field)) {
+                $qb->addGroupBy($field);
+            }
         }
 
-        // Having
         foreach ($this->having as $having) {
-            $param = $this->generateParamName($having['field'], $having['value']);
-            $qb->setParameter($param, $having['value']);
-            $qb->having("{$having['field']} {$having['operator']} :$param");
+            if ($this->hasColumn($having['field'])) {
+                $param = $this->generateParamName($having['field'], $having['value']);
+                $qb->setParameter($param, $having['value']);
+                $qb->having("{$having['field']} {$having['operator']} :$param");
+            }
         }
 
         if ($this->limit !== null) {
@@ -803,11 +1085,6 @@ class QueryBuilder
         return $qb;
     }
 
-    /**
-     * Réinitialise complètement le QueryBuilder
-     * 
-     * @return self
-     */
     public function reset(): self
     {
         $this->conditions = [];
@@ -828,40 +1105,13 @@ class QueryBuilder
         return $this;
     }
 
-    /**
-     * Normalise un nom de champ (id → uid)
-     * 
-     * @param string $field Nom du champ
-     * @return string
-     */
     public function normalizeField(string $field): string
     {
         return $field === 'id' ? 'uid' : $field;
     }
 
     // ================================================================
-    // 10. MÉTHODES PRIVÉES - GESTION DES GROUPES
-    // ================================================================
-
-    private function pushGroup(string $type): void
-    {
-        $this->groupStack[] = $type;
-    }
-
-    private function popGroup(): void
-    {
-        if (count($this->groupStack) > 1) {
-            array_pop($this->groupStack);
-        }
-    }
-
-    private function getCurrentGroup(): string
-    {
-        return end($this->groupStack) ?: 'AND';
-    }
-
-    // ================================================================
-    // 11. MÉTHODES PRIVÉES - AJOUT DE CONDITIONS
+    // MÉTHODES PRIVÉES
     // ================================================================
 
     private function addCondition(string $field, string $operator, mixed $value): self
@@ -906,10 +1156,6 @@ class QueryBuilder
         return $this;
     }
 
-    // ================================================================
-    // 12. MÉTHODES PRIVÉES - UTILITAIRES DE DÉTECTION
-    // ================================================================
-
     private function isJsonPath(string $field): bool
     {
         return strpos($field, '.') !== false;
@@ -935,13 +1181,8 @@ class QueryBuilder
         return 'p_' . preg_replace('/[^a-zA-Z0-9_]/', '_', $field) . '_' . $hash;
     }
 
-    // ================================================================
-    // 13. BUILD WHERE (PRIVÉ)
-    // ================================================================
-
     private function buildWhere(DBALQueryBuilder $qb): void
     {
-        // Raw conditions
         foreach ($this->rawConditions as $raw) {
             $qb->andWhere($raw['sql']);
             foreach ($raw['params'] as $key => $value) {
@@ -949,7 +1190,6 @@ class QueryBuilder
             }
         }
 
-        // Subquery conditions
         foreach ($this->subConditions as $sub) {
             $qb->andWhere("{$sub['field']} {$sub['operator']} ({$sub['sql']})");
             foreach ($sub['params'] as $key => $value) {
@@ -957,7 +1197,6 @@ class QueryBuilder
             }
         }
 
-        // Conditions existantes
         $allConditions = array_merge($this->conditions, $this->groups);
         if (empty($allConditions)) {
             return;
@@ -978,7 +1217,6 @@ class QueryBuilder
         for ($i = 0; $i < $count; $i++) {
             $cond = $conditions[$i];
 
-            // Groupe imbriqué
             if (isset($cond['type']) && $cond['type'] === 'group') {
                 if (!empty($orGroup)) {
                     $clauses[] = '(' . implode(' OR ', $orGroup) . ')';
@@ -992,7 +1230,6 @@ class QueryBuilder
                 continue;
             }
 
-            // Condition simple
             $clause = $this->buildConditionString($qb, $cond);
             $group = $cond['group'] ?? 'AND';
 
@@ -1042,10 +1279,6 @@ class QueryBuilder
             default => $this->buildSimpleCondition($qb, $field, $operator, $value, $param),
         };
     }
-
-    // ================================================================
-    // 14. BUILD CONDITIONS SPÉCIFIQUES (PRIVÉ)
-    // ================================================================
 
     private function buildSimpleCondition(DBALQueryBuilder $qb, string $field, string $operator, $value, string $param): string
     {
@@ -1135,10 +1368,6 @@ class QueryBuilder
         return $isNot ? "NOT $sql" : $sql;
     }
 
-    // ================================================================
-    // 15. BUILD ORDER BY (PRIVÉ)
-    // ================================================================
-
     private function buildOrderBy(DBALQueryBuilder $qb): void
     {
         if ($this->orderByField) {
@@ -1152,7 +1381,9 @@ class QueryBuilder
         }
 
         foreach ($this->orderBy as [$field, $direction]) {
-            $qb->addOrderBy($field, $direction);
+            if ($this->hasColumn($field)) {
+                $qb->addOrderBy($field, $direction);
+            }
         }
     }
 
@@ -1180,10 +1411,6 @@ class QueryBuilder
             $qb->setParameter($key, $value);
         }
     }
-
-    // ================================================================
-    // 16. BUILD JOINS (PRIVÉ)
-    // ================================================================
 
     private function buildJoins(DBALQueryBuilder $qb, string $tableName): void
     {

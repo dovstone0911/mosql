@@ -6,18 +6,19 @@ use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\DriverManager;
 use Dovstone\MoSQL\Cache\ArrayCache;
 use Dovstone\MoSQL\Cache\CacheManager;
+use Dovstone\MoSQL\Cache\SqlFileCacheManager;
 use Dovstone\MoSQL\Document\DocumentManager;
 use Dovstone\MoSQL\Exception\DatabaseException;
 use Dovstone\MoSQL\Exception\DocumentNotFoundException;
 use Dovstone\MoSQL\Exception\DuplicateException;
 use Dovstone\MoSQL\Exception\InvalidArgumentException;
 use Dovstone\MoSQL\Query\QueryBuilder;
+use Dovstone\MoSQL\Query\RawQueryExecutor;
 use Dovstone\MoSQL\Schema\SchemaManager;
-use Dovstone\MoSQL\Cache\SqlFileCacheManager;
 use Dovstone\MoSQL\Uid\UidGenerator;
 
 /**
- * MoSQL - Bibliothèque ORM légère avec support JSON, UID, Cache et Requêtes avancées
+ * MoSQL - Bibliothèque ORM légère avec support JSON, ID, Cache et Requêtes avancées
  * 
  * @package Dovstone\MoSQL
  * @author Dovstone
@@ -46,17 +47,25 @@ class MoSQL
     private Connection $connection;
     private string $collection;
     public QueryBuilder $queryBuilder;
-    private SchemaManager $schemaManager;
-    private DocumentManager $documentManager;
+
+    // Nullable : en mode "brut" (collection === null), aucun de ces objets
+    // n'est instancié. Toute méthode qui en dépend doit d'abord vérifier
+    // isCollectionMode() pour éviter une erreur "typed property not
+    // initialized".
+    private ?SchemaManager $schemaManager = null;
+    private ?DocumentManager $documentManager = null;
+    private ?RawQueryExecutor $rawQueryExecutor = null;
+
     private CacheManager $cacheManager;
     private SqlFileCacheManager $sqlFileCacheManager;
-    private UidGenerator $uidGenerator;
+    private ?UidGenerator $uidGenerator = null;
     private array $options;
     private array $uidCache = [];
 
     // 🔥 Connexion partagée (Singleton)
     private static ?Connection $sharedConnection = null;
     private static array $sharedConfig = [];
+    private const FALSY_VALUE = '😅';
 
     // ================================================================
     // CONSTRUCTEUR & CONNEXION
@@ -87,17 +96,18 @@ class MoSQL
         }
 
         $this->connection = self::$sharedConnection;
+        $this->rawQueryExecutor = new RawQueryExecutor($this->connection);
 
         // 🔥 Sans collection (mode brut)
         if ($collection === null) {
             $this->collection = '';
             $this->options = $options;
+            $this->sqlFileCacheManager = new SqlFileCacheManager();
             $this->cacheManager = new CacheManager(
                 new ArrayCache(),
                 $options['cache_enabled'] ?? false,
                 $options['cache_ttl'] ?? 3600
             );
-            $this->sqlFileCacheManager = new SqlFileCacheManager();
             return;
         }
 
@@ -152,25 +162,37 @@ class MoSQL
     // ================================================================
 
     /**
-     * Vérifie si un champ existe dans la table
+     * Indique si l'instance opère en mode "brut" (sans collection), auquel
+     * cas schemaManager/documentManager/queryBuilder ne sont pas disponibles.
+     * 
+     * @return bool
+     */
+    private function isCollectionMode(): bool
+    {
+        return $this->schemaManager !== null;
+    }
+
+    /**
+     * Vérifie si un champ existe réellement dans la table (à la fois
+     * déclaré et physiquement présent en base).
+     * 
+     * Délègue à QueryBuilder::hasColumn(), qui centralise déjà la logique
+     * de normalisation ('id' -> 'uid') et l'intersection entre schéma
+     * déclaré et colonnes physiques. On évite ainsi de dupliquer cette
+     * logique ici et d'appeler des méthodes internes de SchemaManager.
      * 
      * @param string $field Nom du champ
      * @return bool
      */
     private function fieldExists(string $field): bool
     {
-        if (empty($this->schemaManager->getSchema())) {
-            $this->schemaManager->loadSchema();
-        }
-
-        $schema = $this->schemaManager->getSchema();
-        $fields = array_keys($schema);
-
-        if (in_array($field, ['uid', 'id'])) {
+        if (!$this->isCollectionMode()) {
+            // Mode brut : pas de schéma à vérifier, on laisse passer
+            // (les requêtes brutes sont de la responsabilité de l'appelant).
             return true;
         }
 
-        return in_array($field, $fields);
+        return $this->queryBuilder->hasColumn($field);
     }
 
     /**
@@ -181,6 +203,10 @@ class MoSQL
      */
     private function isJsonField(string $field): bool
     {
+        if (!$this->isCollectionMode()) {
+            return false;
+        }
+
         $schema = $this->schemaManager->getSchema();
         return isset($schema[$field]) && ($schema[$field]['type'] ?? '') === 'json';
     }
@@ -731,11 +757,21 @@ class MoSQL
      */
     public function select(array $fields): self
     {
+        if (empty($fields)) {
+            return $this;
+        }
+
         return $this->proxyDirect('select', [$fields]);
     }
 
     /**
      * Trie les résultats
+     * 
+     * Si le champ demandé n'existe pas (déclaré ET physiquement présent),
+     * on retombe sur le premier champ disponible parmi created_at/updated_at/
+     * uid/id — utile pour garantir un ORDER BY stable en pagination. Si
+     * aucun de ces champs n'existe non plus, on n'ajoute simplement AUCUN
+     * tri plutôt que de générer une requête invalide.
      * 
      * @param string|array $field Nom du champ ou tableau de champs
      * @param string $direction ASC ou DESC
@@ -764,23 +800,41 @@ class MoSQL
             return $this;
         }
 
-        if (!$this->fieldExists($field) && !in_array($field, ['_field'])) {
-            $schema = $this->schemaManager->getSchema();
-            $fields = array_keys($schema);
-            $defaultFields = ['created_at', 'updated_at', 'id', 'uid'];
-            foreach ($defaultFields as $default) {
-                if (in_array($default, $fields)) {
-                    $field = $default;
-                    break;
-                }
+        if ($field !== '_field' && !$this->fieldExists($field)) {
+            $fallback = $this->resolveDefaultOrderField();
+            if ($fallback === null) {
+                // Aucun champ de tri valide : ne pas ajouter de tri
+                return $this;
             }
-            if (!in_array($field, $fields)) {
-                $field = $fields[0] ?? 'id';
-            }
+            $field = $fallback;
         }
 
         $this->queryBuilder->orderBy($field, $direction);
         return $this;
+    }
+
+    /**
+     * Détermine un champ de tri de repli parmi les colonnes qui existent
+     * réellement (déclarées ET physiquement présentes), en préférant les
+     * champs temporels puis les identifiants.
+     * 
+     * @return string|null
+     */
+    private function resolveDefaultOrderField(): ?string
+    {
+        if (!$this->isCollectionMode()) {
+            return null;
+        }
+
+        $existingColumns = $this->queryBuilder->getExistingColumns();
+
+        foreach (['created_at', 'updated_at', 'uid', 'id'] as $default) {
+            if (in_array($default, $existingColumns)) {
+                return $default;
+            }
+        }
+
+        return $existingColumns[0] ?? null;
     }
 
     /**
@@ -791,7 +845,7 @@ class MoSQL
      * @return self
      * 
      * @example
-     * $users->orderByField('uid', ['A7kR9qW2', 'B8sT4vX3']);
+     * $users->orderByField('id', ['A7kR9qW2', 'B8sT4vX3']);
      */
     public function orderByField(string $field, array $orderValues): self
     {
@@ -977,17 +1031,17 @@ class MoSQL
                 $operator = strtolower($value[1]);
 
                 if (in_array($operator, ['in', 'not in'])) {
-                    $this->whereIn($field, $value[2]);
+                    $this->whereIn($field, $value[2] ?: [self::FALSY_VALUE]);
                 } elseif ($operator === 'between') {
-                    $this->whereBetween($field, $value[2][0], $value[2][1]);
+                    $this->whereBetween($field, $value[2][0] ?: self::FALSY_VALUE, $value[2][1] ?: self::FALSY_VALUE);
                 } elseif ($operator === 'like') {
-                    $this->whereLike($field, $value[2]);
+                    $this->whereLike($field, $value[2] ?: self::FALSY_VALUE);
                 } elseif ($operator === 'null' || $operator === 'is null') {
                     $this->whereNull($field);
                 } elseif ($operator === 'not null' || $operator === 'is not null') {
                     $this->whereNotNull($field);
                 } else {
-                    $this->where($field, $value[1], $value[2]);
+                    $this->where($field, $value[1], $value[2] ?: self::FALSY_VALUE);
                 }
                 continue;
             }
@@ -1034,6 +1088,26 @@ class MoSQL
         return $this->applyCriteria($criteria);
     }
 
+    /**
+     * Ajoute une ou plusieurs conditions WHERE
+     * 
+     * @param array|string $field Nom du champ ou tableau de conditions
+     * @param mixed $value Valeur à rechercher (si $field est une chaîne)
+     * @return self
+     * 
+     * @example
+     * $users->whereOneBy('email', 'john@example.com')->findOne();
+     * $users->whereOneBy(['email' => 'john@example.com', 'status' => 'active'])->findOne();
+     */
+    public function whereOneBy($field, $value = null): self
+    {
+        if (is_array($field)) {
+            return $this->proxyDirect('whereOneBy', [$field]);
+        }
+
+        return $this->proxyDirect('whereOneBy', [$field, $value]);
+    }
+
     // ================================================================
     // 11. EXÉCUTION
     // ================================================================
@@ -1061,8 +1135,8 @@ class MoSQL
         $results = $this->documentManager->hydrateAll($results);
 
         $executionTime = microtime(true) - $startTime;
-        $this->sqlFileCacheManager->set($cacheKey, $results);
-        $this->setCache($executionTime);
+        $this->sqlFileCacheManager->set($cacheKey, $results, $executionTime);
+        $this->log($executionTime);
 
         return $results;
     }
@@ -1127,6 +1201,10 @@ class MoSQL
      */
     public function sum(string $field, array|callable|null $criteria = null): float
     {
+        if (!$this->fieldExists($field)) {
+            return 0.0;
+        }
+
         if ($criteria) {
             $this->reset()->applyCriteria($criteria);
         }
@@ -1149,6 +1227,10 @@ class MoSQL
      */
     public function avg(string $field, array|callable|null $criteria = null): float
     {
+        if (!$this->fieldExists($field)) {
+            return 0.0;
+        }
+
         if ($criteria) {
             $this->reset()->applyCriteria($criteria);
         }
@@ -1171,6 +1253,10 @@ class MoSQL
      */
     public function min(string $field, array|callable|null $criteria = null): mixed
     {
+        if (!$this->fieldExists($field)) {
+            return null;
+        }
+
         if ($criteria) {
             $this->reset()->applyCriteria($criteria);
         }
@@ -1193,6 +1279,10 @@ class MoSQL
      */
     public function max(string $field, array|callable|null $criteria = null): mixed
     {
+        if (!$this->fieldExists($field)) {
+            return null;
+        }
+
         if ($criteria) {
             $this->reset()->applyCriteria($criteria);
         }
@@ -1208,29 +1298,29 @@ class MoSQL
     // ================================================================
 
     /**
-     * Trouve un document par son UID
+     * Trouve un document par son ID
      * 
-     * @param string|null $uid UID du document
+     * @param string|null $id ID du document
      * @return array|null Le document ou null
      * 
      * @example
      * $user = $users->find('A7kR9qW2');
      */
-    public function find(string|null $uid): ?array
+    public function find(string|null $id): ?array
     {
         if ($this->collection === '*') {
-            return $this->findInAllCollections($uid);
+            return $this->findInAllCollections($id);
         }
 
-        $cached = $this->cacheManager->get("document_uid_{$uid}");
+        $cached = $this->cacheManager->get("document_uid_{$id}");
         if ($cached !== null) {
             return $cached;
         }
 
         $this->reset();
-        $result = $this->where('uid', '=', $uid)->fetchOne();
+        $result = $this->where('uid', '=', $id)->fetchOne();
         if ($result) {
-            $this->cacheManager->set("document_uid_{$uid}", $result);
+            $this->cacheManager->set("document_uid_{$id}", $result);
         }
         return $result;
     }
@@ -1238,10 +1328,10 @@ class MoSQL
     /**
      * Cherche un document dans toutes les collections
      * 
-     * @param string $uid UID du document
+     * @param string $id ID du document
      * @return array|null Le document avec sa collection ou null
      */
-    private function findInAllCollections(string $uid): ?array
+    private function findInAllCollections(string $id): ?array
     {
         $sm = $this->connection->createSchemaManager();
         $tables = $sm->listTables();
@@ -1258,7 +1348,7 @@ class MoSQL
                     ->select('*')
                     ->from($tableName)
                     ->where('uid = :uid')
-                    ->setParameter('uid', $uid)
+                    ->setParameter('uid', $id)
                     ->executeQuery()
                     ->fetchAssociative();
 
@@ -1277,15 +1367,15 @@ class MoSQL
     /**
      * Trouve un document dans plusieurs collections
      * 
-     * @param string $uid UID du document
+     * @param string $id ID du document
      * @param array $collections Liste des collections
      * @return array|null Le document ou null
      */
-    public function findInCollections(string $uid, array $collections): ?array
+    public function findInCollections(string $id, array $collections): ?array
     {
         foreach ($collections as $collection) {
             $db = new MoSQL($collection, $this->connection->getParams());
-            $result = $db->find($uid);
+            $result = $db->find($id);
             if ($result) {
                 $result['_collection'] = $collection;
                 return $result;
@@ -1295,17 +1385,17 @@ class MoSQL
     }
 
     /**
-     * Trouve un document par UID ou lance une exception
+     * Trouve un document par ID ou lance une exception
      * 
-     * @param string $uid UID du document
+     * @param string $id ID du document
      * @return array Le document
      * @throws DocumentNotFoundException
      */
-    public function findOrFail(string $uid): array
+    public function findOrFail(string $id): array
     {
-        $result = $this->find($uid);
+        $result = $this->find($id);
         if ($result === null) {
-            throw new DocumentNotFoundException("Document with UID '{$uid}' not found");
+            throw new DocumentNotFoundException("Document with ID '{$id}' not found");
         }
         return $result;
     }
@@ -1327,7 +1417,7 @@ class MoSQL
         }
 
         $this->reset();
-        $result = $this->where('id', '=', $id)->fetchOne();
+        $result = $this->where('uid', '=', $id)->fetchOne();
         if ($result) {
             $this->cacheManager->set("document_id_{$id}", $result);
         }
@@ -1335,9 +1425,9 @@ class MoSQL
     }
 
     /**
-     * Trouve un document par ID ou UID
+     * Trouve un document par ID ou ID
      * 
-     * @param string|int $identifier UID ou ID
+     * @param string|int $identifier ID ou ID
      * @return array|null Le document ou null
      */
     public function findByIdentifier(string|int $identifier): ?array
@@ -1447,6 +1537,7 @@ class MoSQL
      */
     public function findIDs(array|callable $criteria = [], ?array $orderBy = null, ?int $limit = null, ?int $offset = null): array
     {
+
         $this->reset();
         $this->applyCriteria($criteria);
 
@@ -1462,8 +1553,9 @@ class MoSQL
 
         $this->offset($offset ?? 0);
 
-        $results = $this->select(['uid'])->fetchAll();
-        return array_column($results, 'uid');
+        $results = $this->select(['uid', 'id'])->fetchAll();
+
+        return array_column($results, 'id');
     }
 
     /**
@@ -1492,8 +1584,9 @@ class MoSQL
 
         $this->offset($offset ?? 0);
 
-        $results = $this->select(['uid'])->fetchAll();
-        $uids = array_column($results, 'uid');
+        $results = $this->select(['uid', 'id'])->fetchAll();
+
+        $uids = array_column($results, 'id');
 
         shuffle($uids);
 
@@ -1511,8 +1604,9 @@ class MoSQL
      */
     public function findIDsFromQuery(): array
     {
-        $results = $this->select(['uid'])->fetchAll();
-        return array_column($results, 'uid');
+        $results = $this->select(['uid', 'id'])->fetchAll();
+
+        return array_column($results, 'id');
     }
 
     /**
@@ -1558,13 +1652,13 @@ class MoSQL
      * Insère un nouveau document
      * 
      * @param array $document Données du document
-     * @return string UID généré
+     * @return array $document généré
      * @throws DuplicateException
      * 
      * @example
-     * $uid = $users->insert(['name' => 'Alice', 'email' => 'alice@example.com']);
+     * $id = $users->insert(['name' => 'Alice', 'email' => 'alice@example.com']);
      */
-    public function insert(array $document): string
+    public function insert(array $document): array
     {
         if (!isset($document['uid'])) {
             $document['uid'] = $this->uidGenerator->generate();
@@ -1572,14 +1666,14 @@ class MoSQL
 
         $existing = $this->findIdByUid($document['uid']);
         if ($existing !== null) {
-            throw new DuplicateException("UID '{$document['uid']}' already exists");
+            throw new DuplicateException("ID '{$document['uid']}' already exists");
         }
 
         try {
             $id = $this->documentManager->insert($document);
             $this->uidCache[$document['uid']] = $id;
             $this->cacheManager->clear();
-            return $document['uid'];
+            return $document;
         } catch (\Exception $e) {
             throw new DatabaseException($e->getMessage(), 0, $e);
         }
@@ -1616,12 +1710,12 @@ class MoSQL
      * Met à jour les documents correspondant aux conditions
      * 
      * @param array $data Données à mettre à jour
-     * @return int Nombre de lignes affectées
+     * @return array $results Tous les documents mis à jour
      * 
      * @example
      * $users->where('age', '<', 18)->update(['status' => 'minor']);
      */
-    public function update(array $data): int
+    public function update(array $data): array
     {
         $conditions = [];
         $hasJsonCondition = false;
@@ -1657,40 +1751,41 @@ class MoSQL
         }
 
         try {
-            $result = $this->documentManager->update($data, $conditions);
+            $results = $this->documentManager->update($data, $conditions);
             $this->cacheManager->clear();
-            return $result;
+            return $results;
         } catch (\Exception $e) {
             throw new DatabaseException($e->getMessage(), 0, $e);
         }
     }
 
-    /**
-     * Met à jour un document par son UID
-     * 
-     * @param string $uid UID du document
-     * @param array $data Données à mettre à jour
-     * @return int Nombre de lignes affectées
-     */
-    public function updateByUid(string $uid, array $data): int
-    {
-        $this->reset();
-        $this->where('uid', '=', $uid);
-        $data['uid'] = $uid;
-        return $this->update($data);
-    }
+    // /**
+    //  * Met à jour un document par son ID
+    //  * 
+    //  * @param string $id ID du document
+    //  * @param array $data Données à mettre à jour
+    //  * @return array Document mis à jour
+    //  */
+    // public function updateByUid(string $id, array $data): array
+    // {
+    //     $this->reset();
+    //     $this->where('uid', '=', $id);
+    //     $data['uid'] = $id;
+    //     return $this->update($data);
+    // }
 
     /**
      * Met à jour un document par son ID
      * 
      * @param int $id ID du document
      * @param array $data Données à mettre à jour
-     * @return int Nombre de lignes affectées
+     * @return array Document mis à jour
      */
-    public function updateById(int $id, array $data): int
+    public function updateById(int $id, array $data): array
     {
         $this->reset();
-        $this->where('id', '=', $id);
+        $this->where('uid', '=', $id);
+        $data['id'] = $id;
         return $this->update($data);
     }
 
@@ -1698,9 +1793,9 @@ class MoSQL
      * Met à jour ou insère un document
      * 
      * @param array $data Données du document
-     * @return string UID du document
+     * @return array Document mis à jour
      */
-    public function upsert(array $data): string
+    public function upsert(array $data): array
     {
         if (isset($data['uid'])) {
             $existing = $this->find($data['uid']);
@@ -1716,7 +1811,7 @@ class MoSQL
      * Met à jour ou insère plusieurs documents
      * 
      * @param array $documents Liste des documents
-     * @return array Liste des UIDs
+     * @return array Liste des documents mis à jour
      */
     public function upsertMany(array $documents): array
     {
@@ -1724,7 +1819,7 @@ class MoSQL
         foreach ($documents as $doc) {
             $uids[] = $this->upsert($doc);
         }
-        return $uids;
+        return $documents;
     }
 
     /**
@@ -1829,7 +1924,8 @@ class MoSQL
         }
 
         if ($hasJsonCondition) {
-            $results = $this->select(['id'])->fetchAll();
+            $results = $this->select(['uid', 'id'])->fetchAll();
+
             $ids = array_column($results, 'id');
 
             if (empty($ids)) {
@@ -1860,15 +1956,15 @@ class MoSQL
     }
 
     /**
-     * Supprime un document par son UID
+     * Supprime un document par son ID
      * 
-     * @param string $uid UID du document
+     * @param string $id ID du document
      * @return int Nombre de lignes supprimées
      */
-    public function deleteByUid(string $uid): int
+    public function deleteByUid(string $id): int
     {
         $this->reset();
-        $this->where('uid', '=', $uid);
+        $this->where('uid', '=', $id);
         return $this->delete();
     }
 
@@ -1881,7 +1977,7 @@ class MoSQL
     public function deleteById(int $id): int
     {
         $this->reset();
-        $this->where('id', '=', $id);
+        $this->where('uid', '=', $id);
         return $this->delete();
     }
 
@@ -2031,7 +2127,7 @@ class MoSQL
     /**
      * Invalide le cache d'un document
      * 
-     * @param string|int $identifier UID ou ID du document
+     * @param string|int $identifier ID ou ID du document
      * @return self
      */
     public function invalidate(string|int $identifier): self
@@ -2052,41 +2148,41 @@ class MoSQL
     }
 
     // ================================================================
-    // 20. CONVERSION UID ↔ ID
+    // 20. CONVERSION ID ↔ ID
     // ================================================================
 
     /**
-     * Trouve l'ID auto-incrémenté à partir d'un UID
+     * Trouve l'ID auto-incrémenté à partir d'un ID
      * 
-     * @param string $uid UID du document
+     * @param string $id ID du document
      * @return int|null ID ou null
      */
-    public function findIdByUid(string $uid): ?int
+    public function findIdByUid(string $id): ?int
     {
-        if (isset($this->uidCache[$uid])) {
-            return $this->uidCache[$uid];
+        if (isset($this->uidCache[$id])) {
+            return $this->uidCache[$id];
         }
 
         $this->reset();
-        $result = $this->where('uid', '=', $uid)->select(['id'])->fetchOne();
+        $result = $this->where('uid', '=', $id)->select(['uid', 'id'])->fetchOne();
         if ($result) {
-            $this->uidCache[$uid] = (int)$result['id'];
+            $this->uidCache[$id] = (int)$result['id'];
             return (int)$result['id'];
         }
         return null;
     }
 
     /**
-     * Trouve l'UID à partir d'un ID
+     * Trouve l'ID à partir d'un ID
      * 
      * @param int $id ID du document
-     * @return string|null UID ou null
+     * @return string|null ID ou null
      */
     public function findUidById(int $id): ?string
     {
         $this->reset();
-        $result = $this->where('id', '=', $id)->select(['uid'])->fetchOne();
-        return $result['uid'] ?? null;
+        $result = $this->where('uid', '=', $id)->select(['uid', 'id'])->fetchOne();
+        return $result['id'] ?? null;
     }
 
     // ================================================================
@@ -2121,7 +2217,7 @@ class MoSQL
      */
     public function getSchema(): array
     {
-        return $this->schemaManager->getSchema();
+        return $this->isCollectionMode() ? $this->schemaManager->getSchema() : [];
     }
 
     /**
@@ -2131,7 +2227,7 @@ class MoSQL
      */
     public function getTableName(): string
     {
-        return $this->schemaManager->getTableName();
+        return $this->isCollectionMode() ? $this->schemaManager->getTableName() : '';
     }
 
     /**
@@ -2168,6 +2264,10 @@ class MoSQL
      */
     public function distinct(string $field): array
     {
+        if (!$this->fieldExists($field)) {
+            return [];
+        }
+
         $qb = $this->connection->createQueryBuilder();
         $qb->select("DISTINCT `$field`")
             ->from($this->getTableName());
@@ -2259,18 +2359,7 @@ class MoSQL
      */
     public function rawQuery(string $sql, array $params = []): array|int
     {
-        if (preg_match('/(FROM|JOIN|UPDATE|INTO)\s+`?_`?/i', $sql)) {
-            return str_starts_with(strtoupper(trim($sql)), 'SELECT') ? [] : 0;
-        }
-
-        $sql = preg_replace_callback('/(FROM|JOIN|UPDATE|INTO|TABLE)\s+([a-zA-Z0-9_-]+)/i', function ($matches) {
-            return $matches[1] . ' ' . str_replace('-', '_', $matches[2]);
-        }, $sql);
-
-        if (str_starts_with(strtoupper(trim($sql)), 'SELECT')) {
-            return $this->connection->executeQuery($sql, $params)->fetchAllAssociative();
-        }
-        return $this->connection->executeStatement($sql, $params);
+        return $this->rawQueryExecutor->rawQuery($sql, $params);
     }
 
     /**
@@ -2291,6 +2380,7 @@ class MoSQL
     public function getData(): array
     {
         $qb = $this->queryBuilder;
+        $built = $qb->build();
 
         return [
             'collection' => $this->collection,
@@ -2303,8 +2393,8 @@ class MoSQL
             'groups' => $qb->getGroups(),
             'group_by' => $qb->getGroupBy(),
             'having' => $qb->getHaving(),
-            'sql' => $qb->build()->getSQL(),
-            'params' => $qb->build()->getParameters()
+            'sql' => $built->getSQL(),
+            'params' => $built->getParameters()
         ];
     }
 
@@ -2330,6 +2420,253 @@ class MoSQL
         return $this;
     }
 
+    // ================================================================
+    // 11. MÉTHODES DE RECHERCHE
+    // ================================================================
+
+    /**
+     * Recherche souple avec OR entre les mots
+     * 
+     * @param string|array $query Chaîne de recherche ou tableau formaté
+     * @param array $fields Champs à indexer
+     * @return self
+     * 
+     * @example
+     * $users->searchBy('john doe', ['name', 'email'])->find();
+     * $users->searchBy([
+     *     'john doe' => ['username', 'lastname'],
+     *     '18' => ['age']
+     * ])->find();
+     */
+    public function searchBy(string|array $query, array $fields = []): self
+    {
+        // Format avancé: [mot] => [champs]
+        if (is_array($query)) {
+            foreach ($query as $searchTerm => $searchFields) {
+                if (is_numeric($searchTerm)) {
+                    continue;
+                }
+                $this->searchByWord($searchTerm, $searchFields);
+            }
+            return $this;
+        }
+
+        if (empty($fields)) {
+            throw new InvalidArgumentException('Fields must be specified for search');
+        }
+
+        $words = $this->extractWords($query);
+
+        if (empty($words)) {
+            return $this;
+        }
+
+        // 🔥 Passer directement à QueryBuilder
+        $this->queryBuilder->searchByWords($words, $fields);
+
+        return $this;
+    }
+
+    /**
+     * Recherche stricte avec AND entre les mots
+     * 
+     * @param string|array $query Chaîne de recherche ou tableau formaté
+     * @param array $fields Champs à indexer
+     * @return self
+     * 
+     * @example
+     * $users->searchStrictBy('john doe', ['name', 'email'])->find();
+     */
+    public function searchStrictBy(string|array $query, array $fields = []): self
+    {
+        if (is_array($query)) {
+            foreach ($query as $searchTerm => $searchFields) {
+                if (is_numeric($searchTerm)) {
+                    continue;
+                }
+                $this->searchByWord($searchTerm, $searchFields);
+            }
+            return $this;
+        }
+
+        if (empty($fields)) {
+            throw new InvalidArgumentException('Fields must be specified for search');
+        }
+
+        $words = $this->extractWords($query);
+
+        if (empty($words)) {
+            return $this;
+        }
+
+        // 🔥 Passer directement à QueryBuilder
+        $this->queryBuilder->searchStrictByWords($words, $fields);
+
+        return $this;
+    }
+
+    /**
+     * Recherche un mot dans des champs avec OR
+     * 
+     * @param string $word Mot à rechercher
+     * @param array $fields Champs à indexer
+     * @return self
+     */
+    private function searchByWord(string $word, array $fields): self
+    {
+        // 🔥 Passer directement à QueryBuilder
+        $this->queryBuilder->searchWord($word, $fields);
+        return $this;
+    }
+
+    /**
+     * Recherche avancée avec différents modes
+     * 
+     * @param string $query Chaîne de recherche
+     * @param array $fields Champs à indexer
+     * @param string $mode 'loose', 'strict', 'exact', 'fuzzy'
+     * @return self
+     * 
+     * @example
+     * $users->search('john doe', ['name', 'email'], 'loose')->find();
+     */
+    public function search(string $query, array $fields, string $mode = 'loose'): self
+    {
+        if (empty($fields)) {
+            throw new InvalidArgumentException('Fields must be specified for search');
+        }
+
+        // 🔥 Passer directement à QueryBuilder
+        $this->queryBuilder->search($query, $fields, $mode);
+
+        return $this;
+    }
+
+    /**
+     * Recherche exacte (phrase entière)
+     * 
+     * @param string $query Phrase à rechercher
+     * @param array $fields Champs à indexer
+     * @return self
+     * 
+     * @example
+     * $users->searchExact('john doe', ['name'])->find();
+     */
+    public function searchExact(string $query, array $fields): self
+    {
+        // 🔥 Passer directement à QueryBuilder
+        $this->queryBuilder->searchExact($query, $fields);
+        return $this;
+    }
+
+    /**
+     * Recherche floue (similarité)
+     * 
+     * @param string $query Chaîne de recherche
+     * @param array $fields Champs à indexer
+     * @param float $threshold Seuil de similarité
+     * @return self
+     * 
+     * @example
+     * $users->searchFuzzy('jon do', ['name'])->find();
+     */
+    public function searchFuzzy(string $query, array $fields, float $threshold = 0.7): self
+    {
+        // 🔥 Passer directement à QueryBuilder
+        $this->queryBuilder->searchFuzzy($query, $fields, $threshold);
+        return $this;
+    }
+
+    /**
+     * Recherche avec score (pertinence)
+     * 
+     * @param string $query Chaîne de recherche
+     * @param array $fields Champs avec poids: ['name' => 10, 'email' => 5]
+     * @return self
+     * 
+     * @example
+     * $users->searchWithScore('john doe', ['name' => 10, 'email' => 5])->find();
+     */
+    public function searchWithScore(string $query, array $fields): self
+    {
+        // 🔥 Passer directement à QueryBuilder
+        $this->queryBuilder->searchWithScore($query, $fields);
+        return $this;
+    }
+
+    /**
+     * Recherche avec indexation automatique des champs
+     * 
+     * @param string $query Chaîne de recherche
+     * @param array $exclude Champs à exclure
+     * @return self
+     * 
+     * @example
+     * $users->searchAll('john doe')->find();
+     */
+    public function searchAll(string $query, array $exclude = []): self
+    {
+        $schema = $this->schemaManager->getSchema();
+
+        $searchableFields = [];
+        $exclude = array_merge($exclude, ['id', 'uid', 'password', 'secret', 'token']);
+
+        foreach ($schema as $field => $config) {
+            if (in_array($field, $exclude)) {
+                continue;
+            }
+
+            $types = ['string', 'text', 'varchar', 'char', 'json'];
+            if (in_array($config['type'] ?? 'string', $types)) {
+                $searchableFields[] = $field;
+            }
+        }
+
+        if (empty($searchableFields)) {
+            return $this;
+        }
+
+        return $this->searchBy($query, $searchableFields);
+    }
+
+    /**
+     * Recherche contextuelle (détecte nombres et dates)
+     * 
+     * @param string $query Chaîne de recherche
+     * @param array $fields Champs à indexer
+     * @return self
+     * 
+     * @example
+     * $users->searchContext('john 18 2024')->find();
+     */
+    public function searchContext(string $query, array $fields = []): self
+    {
+        $words = $this->extractWords($query);
+
+        if (empty($words)) {
+            return $this;
+        }
+
+        $textWords = [];
+        $numberWords = [];
+        $dateWords = [];
+
+        foreach ($words as $word) {
+            if (preg_match('/^\d{4}$/', $word)) {
+                $dateWords[] = $word;
+            } elseif (is_numeric($word)) {
+                $numberWords[] = $word;
+            } else {
+                $textWords[] = $word;
+            }
+        }
+
+        // 🔥 Passer directement à QueryBuilder
+        $this->queryBuilder->searchContext($textWords, $numberWords, $dateWords, $fields);
+
+        return $this;
+    }
+
     /**
      * Exécute un callback si la condition est fausse
      * 
@@ -2344,7 +2681,7 @@ class MoSQL
     }
 
     // ================================================================
-    // 23. MÉTHODES MAGIQUES
+    // 24. MÉTHODES MAGIQUES
     // ================================================================
 
     /**
@@ -2462,12 +2799,32 @@ class MoSQL
     }
 
     /**
-     * Sauvegarde la requête dans le cache
+     * Extrait les mots d'une chaîne de recherche
+     * 
+     * @param string $query Chaîne de recherche
+     * @return array Liste des mots
+     */
+    private function extractWords(string $query): array
+    {
+        $query = trim($query);
+        $query = preg_replace('/\s+/', ' ', $query);
+        $query = preg_replace('/[^\w\s\-@.]/u', '', $query);
+
+        $words = explode(' ', $query);
+        $words = array_filter($words, function ($word) {
+            return strlen($word) >= 2;
+        });
+
+        return array_values(array_unique($words));
+    }
+
+    /**
+     * Sauvegarde la requête dans le log
      * 
      * @param float|null $executionTime Temps d'exécution
      * @return void
      */
-    private function setCache($executionTime = null): void
+    private function log($executionTime = null): void
     {
         $dirname = dirname(__DIR__, 4);
         $time = (new \DateTime())->format('ymd-His');

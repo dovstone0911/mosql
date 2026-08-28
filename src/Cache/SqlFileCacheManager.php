@@ -39,16 +39,21 @@ class SqlFileCacheManager
         return $content['data'];
     }
 
-    public function set(string $key, array|callable $data): void
+    public function set(string $key, array|callable $data, $executionTime = null): void
     {
         $file = $this->getFilePath($key);
         if (is_callable($data)) {
             $data = $data();
         }
 
+        $executionTimeMs = $executionTime !== null ? round($executionTime * 1000, 2) : null;
+
         $payload = [
             'expires_at' => time() + $this->ttl,
             'data' => $data,
+            'execution_time_ms' => $executionTimeMs,
+            'execution_time' => $executionTimeMs !== null ? $executionTimeMs . ' ms' : 'N/A',
+            'executed_at' => date('Y-m-d H:i:s')
         ];
 
         file_put_contents($file, json_encode($payload, JSON_PRETTY_PRINT));
